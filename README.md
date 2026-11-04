@@ -58,11 +58,11 @@ built so far.
 | Package | Responsibility |
 |---|---|
 | `cmd/webhookd` | Service wiring, graceful shutdown |
-| `cmd/webhook-receiver` | Reference receiver: verifies signatures, rejects replays (day 3) |
+| `cmd/webhook-receiver` | Reference receiver: verifies signatures, ignores duplicate deliveries, asks for retries on failure |
 | `internal/config` | Environment configuration with validation |
 | `internal/httpapi` | Probes now; endpoints, events and deliveries later |
 | `internal/event` | Domain: events, endpoints, deliveries; outcome classification; delivery state machine with fenced attempts; retry backoff with jitter (no I/O) |
-| `internal/signing` | HMAC signatures and secret rotation (day 3) |
+| `internal/signing` | HMAC-SHA256 signing headers, verification with constant-time compare and timestamp tolerance, secret rotation with overlap |
 | `internal/postgres` | Connection pool, embedded migrations, store (day 4) |
 | `internal/deliverer` | Workers that claim deliveries and POST them (day 5) |
 | `internal/breaker` | Per-endpoint circuit breaker with shared state (day 6) |
@@ -167,11 +167,76 @@ stays within bounds, a lease exists exactly while in flight, a pending
 delivery always has attempts left, a refused operation changes nothing,
 and a stale token is never accepted. CI fuzzes for 20s on every push.
 
+## Signing
+
+Every delivery carries three headers:
+
+```http
+POST /webhook HTTP/1.1
+Webhook-Id: 1042
+Webhook-Timestamp: 1793786400
+Webhook-Signature: v1=67c9e8d3…aefef7da[, v1=<signature under the previous secret>]
+Content-Type: application/json
+
+{"type":"order.paid","data":{"id":42}}
+```
+
+The signature is `hex(HMAC-SHA256(secret, "<timestamp>.<body>"))`. A
+receiver in any language verifies it in four steps, which is what
+`signing.Verifier` and the reference receiver do:
+
+1. Read the raw body **before** parsing it; the signature is over the
+   bytes on the wire.
+2. Refuse timestamps more than 5 minutes from the receiver's clock. This
+   runs before any HMAC, so the verifier is not a signing oracle for
+   stale inputs, and it is what stops replays of captured requests:
+   the timestamp is inside the MAC, so it cannot be moved.
+3. Compute the HMAC for each secret the receiver holds and compare it in
+   constant time with each `v1=` value in the header. Unknown schemes are
+   skipped, so the gateway can add a `v2` later without breaking anyone.
+4. Use `Webhook-Id` to ignore a delivery already processed: the gateway
+   retries when a response is lost, so a receiver that is not idempotent
+   will act twice.
+
+```bash
+# The same thing with openssl, to check an implementation:
+printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$SECRET"
+```
+
+**Secret rotation.** `Rotation.Rotate(next, now, overlap)` makes the new
+secret current and keeps the old one active for `overlap`. During that
+window the gateway signs every request with both, so a receiver that
+still holds the old secret keeps verifying; after it, only the new one
+signs. At most two secrets are ever active, so a receiver never needs to
+accept more than two. Secrets are `whsec_` + 32 random bytes in hex, and
+anything shorter than 16 bytes or with surrounding whitespace is refused
+at both ends, the two mistakes that make signatures silently never match.
+
+**Reference receiver.** `cmd/webhook-receiver` answers 401 for every
+verification failure (one code for every cause, so a probe learns
+nothing), 200 for a duplicate id, 500 when its handler fails so that the
+gateway retries, and 200 on success. Its duplicate set is in memory and
+swept past the tolerance window; a real receiver keeps it in its
+database keyed by `Webhook-Id`.
+
+```bash
+RECEIVER_SECRETS=whsec_...,whsec_old... RECEIVER_ADDR=:9000 go run ./cmd/webhook-receiver
+```
+
+Tests sign and verify round trips, every rejection (tampered body, wrong
+secret, missing or malformed headers, stale and future timestamps, a
+fresh timestamp on an old signature, unknown schemes), both sides of a
+rotation before and after the overlap, and `FuzzVerify` checks that the
+verifier never accepts a signature it could not have produced. The
+receiver is tested for accept-once, retry-after-failure and both-secrets
+behaviour, and the binary was checked against a signature computed with
+`openssl`.
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
 - [x] **Day 2**: Domain: events, endpoints, deliveries; state machine; outcome classification (2xx, 4xx, 5xx, timeouts); backoff with jitter; fuzzing
-- [ ] **Day 3**: HMAC signing: `Webhook-Signature` / `-Timestamp` / `-Id` headers; secret rotation with an overlap window; reference receiver with replay protection
+- [x] **Day 3**: HMAC signing: `Webhook-Signature` / `-Timestamp` / `-Id` headers; secret rotation with an overlap window; reference receiver with replay protection
 - [ ] **Day 4**: Schema and store: endpoints, events, deliveries; fan-out of one event to every enabled endpoint; idempotency keys; `SKIP LOCKED` claims
 - [ ] **Day 5**: Deliverer: HTTP client with timeouts, body limits, no redirects; scheduled retries; dead-letter after the last attempt
 - [ ] **Day 6**: Per-endpoint circuit breaker with state in PostgreSQL shared by all instances; half-open probes
