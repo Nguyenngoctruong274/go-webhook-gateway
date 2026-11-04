@@ -36,6 +36,9 @@ var (
 	ErrLeaseLost         = errors.New("delivery lease lost")
 	ErrLeaseActive       = errors.New("delivery lease still active")
 	ErrNotFound          = errors.New("not found")
+	// ErrIdempotencyConflict: an idempotency key was reused for an event
+	// with a different type or payload.
+	ErrIdempotencyConflict = errors.New("idempotency key reused for a different event")
 )
 
 var typeRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)

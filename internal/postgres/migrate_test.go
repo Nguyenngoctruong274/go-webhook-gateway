@@ -78,6 +78,9 @@ func TestEmbeddedMigrationsLoad(t *testing.T) {
 	if ms[0].version != 1 || !strings.Contains(ms[0].sql, "CREATE TABLE endpoints") {
 		t.Fatalf("unexpected first migration: %s", ms[0].name)
 	}
+	if len(ms) < 2 || ms[1].version != 2 || !strings.Contains(ms[1].sql, "CREATE TABLE deliveries") {
+		t.Fatalf("unexpected second migration: %+v", ms)
+	}
 }
 
 func TestMigrateIsIdempotent(t *testing.T) {
