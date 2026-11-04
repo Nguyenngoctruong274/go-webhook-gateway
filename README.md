@@ -61,7 +61,7 @@ built so far.
 | `cmd/webhook-receiver` | Reference receiver: verifies signatures, rejects replays (day 3) |
 | `internal/config` | Environment configuration with validation |
 | `internal/httpapi` | Probes now; endpoints, events and deliveries later |
-| `internal/event` | Domain: events, endpoints, deliveries, state machine, retry policy (no I/O) (day 2) |
+| `internal/event` | Domain: events, endpoints, deliveries; outcome classification; delivery state machine with fenced attempts; retry backoff with jitter (no I/O) |
 | `internal/signing` | HMAC signatures and secret rotation (day 3) |
 | `internal/postgres` | Connection pool, embedded migrations, store (day 4) |
 | `internal/deliverer` | Workers that claim deliveries and POST them (day 5) |
@@ -106,10 +106,71 @@ the database URL (it holds a password).
 - On `SIGTERM`: readiness turns 503, the service waits `WH_SHUTDOWN_DRAIN`,
   then shuts the HTTP server down within `WH_SHUTDOWN_TIMEOUT`.
 
+## Domain
+
+`internal/event` holds the rules and no I/O; the store and the deliverer
+apply them, and the tests here are the reference.
+
+**Events and endpoints.** A producer publishes `Spec{Type, Payload,
+IdempotencyKey}`: the type is `order.paid`-style, the payload a JSON
+object or array up to 256 KiB. A customer registers `EndpointSpec{URL,
+Types, MaxAttempts}`: absolute http(s), no credentials or fragment,
+subscribed to listed types or to all. Whether the URL's host may be
+contacted at all is decided at delivery time against the resolved
+address (day 7), because DNS can change after registration.
+
+**Outcome of an attempt.**
+
+| Receiver's answer | Outcome | Then |
+|---|---|---|
+| 2xx | `Delivered` | done |
+| 5xx, 408, 429, timeout, connection error | `Retry` | next attempt after the backoff; `failed` once attempts are spent |
+| any other 4xx, 3xx (redirects are not followed) | `Rejected` | done: repeating the same request would get the same answer |
+| gateway refused to send (forbidden address) | `Blocked` | done: the endpoint needs fixing |
+
+**Delivery lifecycle.** One event × one subscribed endpoint = one
+delivery, with the endpoint's `MaxAttempts` copied in at fan-out time.
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending
+    pending --> in_flight: Claim (attempt++, lease)
+    in_flight --> delivered: Finish 2xx
+    in_flight --> rejected: Finish 4xx
+    in_flight --> blocked: Finish blocked
+    in_flight --> pending: Finish retry / Expire, attempts left (backoff)
+    in_flight --> failed: Finish retry / Expire, attempts spent
+    pending --> cancelled: Cancel
+    delivered --> pending: Replay
+    failed --> pending: Replay
+    rejected --> pending: Replay
+    blocked --> pending: Replay
+    cancelled --> pending: Replay
+```
+
+The attempt number is a fencing token: `Claim` returns it, and `Finish`
+and `Heartbeat` must present it. A deliverer that stalled past its lease
+and reports after the reaper handed the delivery on is refused with
+`ErrLeaseLost`; the attempt that replaced it is untouched. Every refused
+transition leaves the delivery exactly as it was.
+
+**Retry backoff.** `Backoff{Base, Max, JitterPercent}`: the ceiling
+doubles per failed attempt from 5s, capped at 1h, and half of it is
+random by default, so a receiver recovering from an outage is not hit by
+every pending delivery at once. With the default 8 attempts the last
+retry comes about 21 minutes after the first failure.
+
+`FuzzDeliveryInvariants` drives a delivery through random sequences of
+claim, finish (every outcome), stale-token finish, expire, cancel, replay
+and heartbeat, with time moving, and checks that the attempt counter
+stays within bounds, a lease exists exactly while in flight, a pending
+delivery always has attempts left, a refused operation changes nothing,
+and a stale token is never accepted. CI fuzzes for 20s on every push.
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
-- [ ] **Day 2**: Domain: events, endpoints, deliveries; state machine; outcome classification (2xx, 4xx, 5xx, timeouts); backoff with jitter; fuzzing
+- [x] **Day 2**: Domain: events, endpoints, deliveries; state machine; outcome classification (2xx, 4xx, 5xx, timeouts); backoff with jitter; fuzzing
 - [ ] **Day 3**: HMAC signing: `Webhook-Signature` / `-Timestamp` / `-Id` headers; secret rotation with an overlap window; reference receiver with replay protection
 - [ ] **Day 4**: Schema and store: endpoints, events, deliveries; fan-out of one event to every enabled endpoint; idempotency keys; `SKIP LOCKED` claims
 - [ ] **Day 5**: Deliverer: HTTP client with timeouts, body limits, no redirects; scheduled retries; dead-letter after the last attempt
