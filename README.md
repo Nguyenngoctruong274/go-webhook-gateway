@@ -63,7 +63,7 @@ built so far.
 | `internal/httpapi` | Probes now; endpoints, events and deliveries later |
 | `internal/event` | Domain: events, endpoints, deliveries; outcome classification; delivery state machine with fenced attempts; retry backoff with jitter (no I/O) |
 | `internal/signing` | HMAC-SHA256 signing headers, verification with constant-time compare and timestamp tolerance, secret rotation with overlap |
-| `internal/postgres` | Connection pool, embedded migrations, store (day 4) |
+| `internal/postgres` | Connection pool, embedded migrations, store: endpoints with secret rotation, events fanned out to deliveries with idempotency keys, deliveries claimed with `SKIP LOCKED` and finished under a fencing token |
 | `internal/deliverer` | Workers that claim deliveries and POST them (day 5) |
 | `internal/breaker` | Per-endpoint circuit breaker with shared state (day 6) |
 | `internal/testdb` | Isolated PostgreSQL schema per test |
@@ -232,12 +232,114 @@ receiver is tested for accept-once, retry-after-failure and both-secrets
 behaviour, and the binary was checked against a signature computed with
 `openssl`.
 
+## Store
+
+`internal/postgres` keeps three tables and applies the domain to them.
+Every transition locks the row, runs the `event.Delivery` method on it at
+the database's `now()` and writes the result back in one transaction, so
+what the domain's tests and fuzzing prove holds for the stored rows too,
+and a refused transition writes nothing.
+
+```mermaid
+erDiagram
+    endpoints ||--o{ deliveries : "fan-out"
+    events ||--o{ deliveries : "fan-out"
+    endpoints {
+        bigint id PK
+        text url
+        text[] types "empty = all"
+        bool enabled
+        int max_attempts
+        text secret "+ previous_secret, previous_secret_until"
+    }
+    events {
+        bigint id PK
+        text type
+        json payload "bytes kept as published"
+        text idempotency_key "unique when set"
+    }
+    deliveries {
+        bigint id PK
+        text state
+        int attempt "fencing token"
+        int max_attempts "copied at fan-out"
+        timestamptz next_attempt_at
+        timestamptz lease_until
+        int last_status
+        text last_error
+    }
+```
+
+**Publish and fan-out.** `Publish` inserts the event and, in the same
+transaction, one pending delivery per enabled endpoint subscribed to its
+type, copying each endpoint's attempt limit into the delivery. The event
+and its fan-out exist together or not at all. The payload column is
+`json`, not `jsonb`: the bytes a receiver gets are the bytes the producer
+published, key order and spacing included, which matters to a producer
+that hashed or signed them itself.
+
+**Idempotency keys.** A key is unique among events for as long as the
+event exists. A producer that retries after a timeout with the same key
+gets the event it already published, with no second fan-out; the same
+key with a different type or payload is refused with
+`ErrIdempotencyConflict`, because silently returning the first event
+would hide a producer bug. The insert uses `ON CONFLICT DO NOTHING` and a
+second statement reads the holder, since the insert's snapshot predates a
+concurrent holder's commit.
+
+**Secrets.** An endpoint's signing secret is generated at registration
+and returned once. `RotateSecret` applies `signing.Rotation.Rotate` under
+a row lock and stores the previous secret with the end of its overlap;
+`Secrets` is a separate read, so endpoint listings never carry secrets.
+
+**Claiming.** Deliverers call `Claim(limit, lease)`:
+
+```sql
+WITH due AS (
+    SELECT id FROM deliveries
+    WHERE state = 'pending' AND next_attempt_at <= now()
+    ORDER BY next_attempt_at, id
+    LIMIT $1
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE deliveries AS d
+SET state = 'in_flight', attempt = d.attempt + 1, lease_until = now() + $2 * interval '1 microsecond'
+FROM events AS e, endpoints AS p
+WHERE d.id IN (SELECT id FROM due) AND e.id = d.event_id AND p.id = d.endpoint_id
+RETURNING d.*, e.type, e.payload, p.url, p.secret, p.previous_secret, p.previous_secret_until
+```
+
+The CTE walks the partial index on pending deliveries in due order and
+locks the first rows nobody else holds; rows another deliverer is
+claiming are skipped rather than waited for, and once that claim commits
+they are in flight and no longer match. Each attempt therefore goes to
+exactly one deliverer, which is what the fencing token relies on. The
+join returns the body, the URL and the secrets in the same round trip, so
+sending needs no further reads. `Finish` and `Heartbeat` take the
+attempt number `Claim` returned; a stale one is refused with
+`ErrLeaseLost` and the attempt that replaced it is untouched.
+
+**Constraints as a second line of defence.** The `deliveries` table
+restates the domain's invariants as `CHECK` constraints: a lease exists
+exactly while in flight, a pending delivery has attempts left, an
+in-flight one has an attempt, `delivered_at` is set exactly when
+delivered, and the attempt never exceeds the limit. A bug in a query
+cannot store a delivery the state machine would never produce; the test
+suite inserts each impossible row and expects a refusal.
+
+Tests run against a real PostgreSQL (`make test-db`, or CI's service
+container) in an isolated schema per test: fan-out to the right endpoints
+only, byte-exact payloads, every idempotency outcome, each store
+transition and its refusal, and 16 deliverers draining 1 500 deliveries
+with random batch sizes while a log asserts that no delivery is claimed
+twice.
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
 - [x] **Day 2**: Domain: events, endpoints, deliveries; state machine; outcome classification (2xx, 4xx, 5xx, timeouts); backoff with jitter; fuzzing
 - [x] **Day 3**: HMAC signing: `Webhook-Signature` / `-Timestamp` / `-Id` headers; secret rotation with an overlap window; reference receiver with replay protection
-- [ ] **Day 4**: Schema and store: endpoints, events, deliveries; fan-out of one event to every enabled endpoint; idempotency keys; `SKIP LOCKED` claims
+- [x] **Day 4**: Schema and store: endpoints, events, deliveries; fan-out of one event to every enabled endpoint; idempotency keys; `SKIP LOCKED` claims
 - [ ] **Day 5**: Deliverer: HTTP client with timeouts, body limits, no redirects; scheduled retries; dead-letter after the last attempt
 - [ ] **Day 6**: Per-endpoint circuit breaker with state in PostgreSQL shared by all instances; half-open probes
 - [ ] **Day 7**: SSRF protection (private, loopback and link-local ranges, pinned DNS); per-endpoint rate limit; optional in-order delivery per endpoint
