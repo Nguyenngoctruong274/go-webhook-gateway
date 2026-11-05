@@ -64,7 +64,8 @@ built so far.
 | `internal/event` | Domain: events, endpoints, deliveries; outcome classification; delivery state machine with fenced attempts; retry backoff with jitter (no I/O) |
 | `internal/signing` | HMAC-SHA256 signing headers, verification with constant-time compare and timestamp tolerance, secret rotation with overlap |
 | `internal/postgres` | Connection pool, embedded migrations, store: endpoints with secret rotation, events fanned out to deliveries with idempotency keys, deliveries claimed with `SKIP LOCKED` and finished under a fencing token |
-| `internal/deliverer` | Workers that claim deliveries and POST them (day 5) |
+| `internal/deliverer` | Sender: one signed POST per attempt with timeouts, bounded response reads, no redirects; Pool: bounded concurrency, heartbeats, drain |
+| `internal/reaper` | Timer loop that returns silent deliverers' deliveries to the queue |
 | `internal/breaker` | Per-endpoint circuit breaker with shared state (day 6) |
 | `internal/testdb` | Isolated PostgreSQL schema per test |
 
@@ -93,6 +94,11 @@ Or run everything in containers: `make stack`.
 | `WH_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `WH_SHUTDOWN_TIMEOUT` | `15s` | Maximum time to finish in-flight requests |
 | `WH_SHUTDOWN_DRAIN` | `0` | Time `/readyz` reports 503 before the listener closes |
+| `WH_DELIVER_CONCURRENCY` | `16` | Requests in flight at once on this instance, `0` to `1000`; `0` runs no deliverers |
+| `WH_DELIVER_TIMEOUT` | `10s` | End-to-end timeout of one request to a receiver (at least `1s`) |
+| `WH_DELIVER_LEASE` | `60s` | Lease on a claimed delivery; must exceed the timeout; heartbeats renew it every third |
+| `WH_DELIVER_DRAIN` | `15s` | On shutdown, how long in-flight requests may finish before they are cancelled |
+| `WH_REAP_INTERVAL` | `5s` | How often expired leases are swept (at least `100ms`) |
 
 Invalid configuration is reported all at once at startup, without echoing
 the database URL (it holds a password).
@@ -334,13 +340,62 @@ transition and its refusal, and 16 deliverers draining 1 500 deliveries
 with random batch sizes while a log asserts that no delivery is claimed
 twice.
 
+## Delivering
+
+`deliverer.Pool` claims due deliveries in batches of however many
+request slots are free, sends each through a `Sender`, and reports the
+outcome with the attempt number as the fencing token. `internal/reaper`
+sweeps leases that ran out.
+
+**One request.** `POST` to the endpoint's URL with the event payload as
+body, `Content-Type: application/json`, `Webhook-Event-Type`, the three
+signing headers, and `User-Agent: go-webhook-gateway/1.0`.
+
+- **Timeouts end to end.** Dial 5s, TLS 5s, and `WH_DELIVER_TIMEOUT` for
+  the whole request including the response body. A receiver slower than
+  that gets a `Retry`; it had its chance, and the lease is sized so that
+  the gateway never sends the same attempt twice.
+- **Redirects are not followed.** A 3xx would send a signed,
+  secret-bound request to a host the customer did not register. The 3xx
+  is recorded as a rejection.
+- **Bounded reads.** At most 4 KiB of the response is read for the
+  history and the rest is discarded without being downloaded, so a
+  receiver cannot fill the history table or the deliverer's memory.
+  Bodies are drained, so connections are reused: five sends, one
+  connection.
+- **Every failure is an outcome, never a crash.** No usable secret or
+  an unparsable URL is `Blocked` (the gateway's fault); a timeout, refused
+  connection or cancelled request is `Retry`; a body that breaks after
+  a 2xx is `Retry` too, because the receiver may or may not have acted.
+
+**The pool.** Concurrency is a slot count: the pool claims only as many
+deliveries as it has free slots, so a claimed delivery never waits in
+memory while its lease runs down. Each in-flight request is heartbeated
+every third of the lease; when a heartbeat learns the lease is gone
+(another deliverer took it over), the request is cancelled, since its
+outcome could no longer be reported. On shutdown the pool stops claiming,
+waits `WH_DELIVER_DRAIN` for in-flight requests, then cancels the rest;
+a cancelled attempt is reported as transient, so it retries elsewhere.
+
+**The reaper.** A deliverer that crashes stops heartbeating; once the
+lease runs out the reaper ends the attempt as a transient failure, one
+transaction per delivery, and the delivery retries after the backoff or
+fails for good. `TestReapersRaceDeliverers` has 30 deliverers finish just
+as 3 reapers sweep 3 ms leases: every attempt ends exactly once, and the
+table agrees with what the deliverers were told.
+
+Checked against the real binaries: a receiver on one port and a dead
+address on another, one event fanned out to both; the first delivery was
+`delivered` with a verified signature, the second `pending` with
+`transport: … connection refused` and a retry scheduled.
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
 - [x] **Day 2**: Domain: events, endpoints, deliveries; state machine; outcome classification (2xx, 4xx, 5xx, timeouts); backoff with jitter; fuzzing
 - [x] **Day 3**: HMAC signing: `Webhook-Signature` / `-Timestamp` / `-Id` headers; secret rotation with an overlap window; reference receiver with replay protection
 - [x] **Day 4**: Schema and store: endpoints, events, deliveries; fan-out of one event to every enabled endpoint; idempotency keys; `SKIP LOCKED` claims
-- [ ] **Day 5**: Deliverer: HTTP client with timeouts, body limits, no redirects; scheduled retries; dead-letter after the last attempt
+- [x] **Day 5**: Deliverer: HTTP client with timeouts, body limits, no redirects; scheduled retries; dead-letter after the last attempt
 - [ ] **Day 6**: Per-endpoint circuit breaker with state in PostgreSQL shared by all instances; half-open probes
 - [ ] **Day 7**: SSRF protection (private, loopback and link-local ranges, pinned DNS); per-endpoint rate limit; optional in-order delivery per endpoint
 - [ ] **Day 8**: Customer API: delivery history with response snippets, replay, pause and resume endpoints; end-to-end tests against the reference receiver
