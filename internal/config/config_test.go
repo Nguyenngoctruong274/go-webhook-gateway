@@ -21,6 +21,12 @@ func TestLoadDefaults(t *testing.T) {
 		DBMaxConns:      20,
 		ShutdownTimeout: 15 * time.Second,
 		LogLevel:        "info",
+
+		DeliverConcurrency: 16,
+		DeliverTimeout:     10 * time.Second,
+		DeliverLease:       60 * time.Second,
+		DeliverDrain:       15 * time.Second,
+		ReapInterval:       5 * time.Second,
 	}
 	if cfg != want {
 		t.Fatalf("got %+v, want %+v", cfg, want)
@@ -29,18 +35,25 @@ func TestLoadDefaults(t *testing.T) {
 
 func TestLoadOverrides(t *testing.T) {
 	cfg, err := load(envFrom(map[string]string{
-		"WH_HTTP_ADDR":        "127.0.0.1:9090",
-		"WH_DATABASE_URL":     "postgresql://u:p@db.internal:5433/webhooks?sslmode=require",
-		"WH_DB_MAX_CONNS":     "50",
-		"WH_SHUTDOWN_TIMEOUT": "30s",
-		"WH_SHUTDOWN_DRAIN":   "5s",
-		"WH_LOG_LEVEL":        "debug",
+		"WH_HTTP_ADDR":           "127.0.0.1:9090",
+		"WH_DATABASE_URL":        "postgresql://u:p@db.internal:5433/webhooks?sslmode=require",
+		"WH_DB_MAX_CONNS":        "50",
+		"WH_SHUTDOWN_TIMEOUT":    "30s",
+		"WH_SHUTDOWN_DRAIN":      "5s",
+		"WH_LOG_LEVEL":           "debug",
+		"WH_DELIVER_CONCURRENCY": "0",
+		"WH_DELIVER_TIMEOUT":     "3s",
+		"WH_DELIVER_LEASE":       "20s",
+		"WH_DELIVER_DRAIN":       "0s",
+		"WH_REAP_INTERVAL":       "1s",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.HTTPAddr != "127.0.0.1:9090" || cfg.ShutdownTimeout != 30*time.Second ||
-		cfg.ShutdownDrain != 5*time.Second || cfg.LogLevel != "debug" || cfg.DBMaxConns != 50 {
+		cfg.ShutdownDrain != 5*time.Second || cfg.LogLevel != "debug" || cfg.DBMaxConns != 50 ||
+		cfg.DeliverConcurrency != 0 || cfg.DeliverTimeout != 3*time.Second || cfg.DeliverLease != 20*time.Second ||
+		cfg.DeliverDrain != 0 || cfg.ReapInterval != time.Second {
 		t.Fatalf("unexpected config %+v", cfg)
 	}
 }
@@ -68,6 +81,21 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 				"WH_SHUTDOWN_DRAIN":   "-1s",
 			},
 			want: []string{"WH_DB_MAX_CONNS", "WH_SHUTDOWN_TIMEOUT: must be positive", "WH_SHUTDOWN_DRAIN"},
+		},
+		{
+			name: "deliverer settings",
+			env: map[string]string{
+				"WH_DATABASE_URL":        "postgres://localhost/webhooks",
+				"WH_DELIVER_CONCURRENCY": "1001",
+				"WH_DELIVER_TIMEOUT":     "500ms",
+				"WH_REAP_INTERVAL":       "10ms",
+			},
+			want: []string{"WH_DELIVER_CONCURRENCY", "WH_DELIVER_TIMEOUT: must be a duration of at least 1s", "WH_REAP_INTERVAL"},
+		},
+		{
+			name: "lease must exceed the timeout",
+			env:  map[string]string{"WH_DATABASE_URL": "postgres://localhost/webhooks", "WH_DELIVER_TIMEOUT": "60s"},
+			want: []string{"WH_DELIVER_LEASE: must be longer"},
 		},
 		{
 			name: "every error is reported at once",

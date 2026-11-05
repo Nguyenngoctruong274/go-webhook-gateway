@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/config"
+	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/deliverer"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/httpapi"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/postgres"
+	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/reaper"
 )
 
 var errDraining = errors.New("shutting down")
@@ -55,6 +57,49 @@ func run() error {
 		return err
 	}
 	logger.Info("database ready", slog.Int("max_conns", cfg.DBMaxConns))
+	store, err := postgres.NewStore(db)
+	if err != nil {
+		return err
+	}
+
+	// The reaper runs until shutdown and is awaited before the database
+	// handle is closed (defers run in reverse order).
+	reapCtx, stopReaper := context.WithCancel(context.Background())
+	reaperDone := make(chan struct{})
+	go func() {
+		defer close(reaperDone)
+		_ = reaper.New(store, logger, reaper.Options{Interval: cfg.ReapInterval}).Run(reapCtx)
+	}()
+	defer func() {
+		stopReaper()
+		<-reaperDone
+		logger.Info("reaper stopped")
+	}()
+
+	// Deliverers start draining as soon as the shutdown signal arrives, in
+	// parallel with the HTTP drain, and are awaited before the database
+	// handle closes, so every in-flight request is reported.
+	if cfg.DeliverConcurrency > 0 {
+		pool, err := deliverer.New(store, deliverer.NewSender(cfg.DeliverTimeout), logger, deliverer.Options{
+			Concurrency:  cfg.DeliverConcurrency,
+			Lease:        cfg.DeliverLease,
+			DrainTimeout: cfg.DeliverDrain,
+		})
+		if err != nil {
+			return err
+		}
+		poolCtx, stopPool := context.WithCancel(ctx)
+		poolDone := make(chan struct{})
+		go func() {
+			defer close(poolDone)
+			_ = pool.Run(poolCtx)
+		}()
+		defer func() {
+			stopPool()
+			<-poolDone
+		}()
+	}
+
 	// Readiness turns false the moment shutdown starts, so load balancers
 	// stop routing new requests while in-flight ones finish.
 	var draining atomic.Bool
