@@ -9,6 +9,7 @@ import (
 
 	"github.com/lib/pq"
 
+	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/breaker"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/event"
 )
 
@@ -20,6 +21,7 @@ type Store struct {
 	db      *sql.DB
 	backoff event.Backoff
 	rnd     event.Rand // nil: the shared math/rand source
+	breaker breaker.Policy
 }
 
 // Option configures a Store.
@@ -38,11 +40,11 @@ func WithRand(r event.Rand) Option {
 
 // NewStore returns a Store using db. The caller owns db and closes it.
 func NewStore(db *sql.DB, opts ...Option) (*Store, error) {
-	s := &Store{db: db, backoff: event.DefaultBackoff()}
+	s := &Store{db: db, backoff: event.DefaultBackoff(), breaker: breaker.DefaultPolicy()}
 	for _, o := range opts {
 		o(s)
 	}
-	if err := s.backoff.Validate(); err != nil {
+	if err := errors.Join(s.backoff.Validate(), s.breaker.Validate()); err != nil {
 		return nil, fmt.Errorf("store: %w", err)
 	}
 	return s, nil

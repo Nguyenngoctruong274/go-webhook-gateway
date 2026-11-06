@@ -27,6 +27,11 @@ func TestLoadDefaults(t *testing.T) {
 		DeliverLease:       60 * time.Second,
 		DeliverDrain:       15 * time.Second,
 		ReapInterval:       5 * time.Second,
+
+		BreakerFailures:     5,
+		BreakerOpenFor:      30 * time.Second,
+		BreakerMaxOpenFor:   15 * time.Minute,
+		BreakerProbeTimeout: 2 * time.Minute,
 	}
 	if cfg != want {
 		t.Fatalf("got %+v, want %+v", cfg, want)
@@ -46,6 +51,11 @@ func TestLoadOverrides(t *testing.T) {
 		"WH_DELIVER_LEASE":       "20s",
 		"WH_DELIVER_DRAIN":       "0s",
 		"WH_REAP_INTERVAL":       "1s",
+
+		"WH_BREAKER_FAILURES":      "3",
+		"WH_BREAKER_OPEN_FOR":      "10s",
+		"WH_BREAKER_MAX_OPEN_FOR":  "1m",
+		"WH_BREAKER_PROBE_TIMEOUT": "20s",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -53,7 +63,9 @@ func TestLoadOverrides(t *testing.T) {
 	if cfg.HTTPAddr != "127.0.0.1:9090" || cfg.ShutdownTimeout != 30*time.Second ||
 		cfg.ShutdownDrain != 5*time.Second || cfg.LogLevel != "debug" || cfg.DBMaxConns != 50 ||
 		cfg.DeliverConcurrency != 0 || cfg.DeliverTimeout != 3*time.Second || cfg.DeliverLease != 20*time.Second ||
-		cfg.DeliverDrain != 0 || cfg.ReapInterval != time.Second {
+		cfg.DeliverDrain != 0 || cfg.ReapInterval != time.Second ||
+		cfg.BreakerFailures != 3 || cfg.BreakerOpenFor != 10*time.Second || cfg.BreakerMaxOpenFor != time.Minute ||
+		cfg.BreakerProbeTimeout != 20*time.Second {
 		t.Fatalf("unexpected config %+v", cfg)
 	}
 }
@@ -96,6 +108,17 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 			name: "lease must exceed the timeout",
 			env:  map[string]string{"WH_DATABASE_URL": "postgres://localhost/webhooks", "WH_DELIVER_TIMEOUT": "60s"},
 			want: []string{"WH_DELIVER_LEASE: must be longer"},
+		},
+		{
+			name: "breaker settings",
+			env: map[string]string{
+				"WH_DATABASE_URL":          "postgres://localhost/webhooks",
+				"WH_BREAKER_FAILURES":      "0",
+				"WH_BREAKER_OPEN_FOR":      "5m",
+				"WH_BREAKER_MAX_OPEN_FOR":  "1m",
+				"WH_BREAKER_PROBE_TIMEOUT": "5s",
+			},
+			want: []string{"WH_BREAKER_FAILURES", "WH_BREAKER_MAX_OPEN_FOR: must be at least", "WH_BREAKER_PROBE_TIMEOUT: must be longer"},
 		},
 		{
 			name: "every error is reported at once",

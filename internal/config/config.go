@@ -37,6 +37,17 @@ type Config struct {
 	DeliverDrain time.Duration
 	// ReapInterval is how often expired leases are swept.
 	ReapInterval time.Duration
+
+	// BreakerFailures consecutive transient failures open an endpoint's
+	// circuit breaker.
+	BreakerFailures int
+	// BreakerOpenFor is the first open period; it doubles after each
+	// failed probe up to BreakerMaxOpenFor.
+	BreakerOpenFor    time.Duration
+	BreakerMaxOpenFor time.Duration
+	// BreakerProbeTimeout is how long a half-open probe may stay silent
+	// before another probe is allowed.
+	BreakerProbeTimeout time.Duration
 }
 
 // Load reads configuration from environment variables, applying defaults
@@ -59,6 +70,11 @@ func load(getenv func(string) string) (Config, error) {
 		DeliverLease:       60 * time.Second,
 		DeliverDrain:       15 * time.Second,
 		ReapInterval:       5 * time.Second,
+
+		BreakerFailures:     5,
+		BreakerOpenFor:      30 * time.Second,
+		BreakerMaxOpenFor:   15 * time.Minute,
+		BreakerProbeTimeout: 2 * time.Minute,
 	}
 
 	var errs []error
@@ -108,6 +124,14 @@ func load(getenv func(string) string) (Config, error) {
 			cfg.DeliverConcurrency = n
 		}
 	}
+	if raw := getenv("WH_BREAKER_FAILURES"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			errs = append(errs, errors.New("WH_BREAKER_FAILURES: must be a positive integer"))
+		} else {
+			cfg.BreakerFailures = n
+		}
+	}
 	for _, d := range []struct {
 		name string
 		dst  *time.Duration
@@ -117,6 +141,9 @@ func load(getenv func(string) string) (Config, error) {
 		{"WH_DELIVER_LEASE", &cfg.DeliverLease, time.Second},
 		{"WH_DELIVER_DRAIN", &cfg.DeliverDrain, 0},
 		{"WH_REAP_INTERVAL", &cfg.ReapInterval, 100 * time.Millisecond},
+		{"WH_BREAKER_OPEN_FOR", &cfg.BreakerOpenFor, time.Second},
+		{"WH_BREAKER_MAX_OPEN_FOR", &cfg.BreakerMaxOpenFor, time.Second},
+		{"WH_BREAKER_PROBE_TIMEOUT", &cfg.BreakerProbeTimeout, time.Second},
 	} {
 		raw := getenv(d.name)
 		if raw == "" {
@@ -131,6 +158,12 @@ func load(getenv func(string) string) (Config, error) {
 	}
 	if cfg.DeliverLease <= cfg.DeliverTimeout {
 		errs = append(errs, errors.New("WH_DELIVER_LEASE: must be longer than WH_DELIVER_TIMEOUT, or a slow receiver could get a request twice"))
+	}
+	if cfg.BreakerMaxOpenFor < cfg.BreakerOpenFor {
+		errs = append(errs, errors.New("WH_BREAKER_MAX_OPEN_FOR: must be at least WH_BREAKER_OPEN_FOR"))
+	}
+	if cfg.BreakerProbeTimeout <= cfg.DeliverTimeout {
+		errs = append(errs, errors.New("WH_BREAKER_PROBE_TIMEOUT: must be longer than WH_DELIVER_TIMEOUT, or a probe still in flight would be duplicated"))
 	}
 
 	switch cfg.LogLevel {

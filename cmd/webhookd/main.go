@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/breaker"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/config"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/deliverer"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/httpapi"
@@ -57,7 +58,12 @@ func run() error {
 		return err
 	}
 	logger.Info("database ready", slog.Int("max_conns", cfg.DBMaxConns))
-	store, err := postgres.NewStore(db)
+	store, err := postgres.NewStore(db, postgres.WithBreaker(breaker.Policy{
+		FailureThreshold: cfg.BreakerFailures,
+		OpenFor:          cfg.BreakerOpenFor,
+		MaxOpenFor:       cfg.BreakerMaxOpenFor,
+		ProbeTimeout:     cfg.BreakerProbeTimeout,
+	}))
 	if err != nil {
 		return err
 	}
