@@ -66,7 +66,7 @@ built so far.
 | `internal/postgres` | Connection pool, embedded migrations, store: endpoints with secret rotation, events fanned out to deliveries with idempotency keys, deliveries claimed with `SKIP LOCKED` and finished under a fencing token |
 | `internal/deliverer` | Sender: one signed POST per attempt with timeouts, bounded response reads, no redirects; Pool: bounded concurrency, heartbeats, drain |
 | `internal/reaper` | Timer loop that returns silent deliverers' deliveries to the queue |
-| `internal/breaker` | Per-endpoint circuit breaker with shared state (day 6) |
+| `internal/breaker` | Per-endpoint circuit breaker: closed / open / half-open as a pure value; the store keeps one per endpoint so every instance sees the same breaker |
 | `internal/testdb` | Isolated PostgreSQL schema per test |
 
 ## Quick start
@@ -99,6 +99,10 @@ Or run everything in containers: `make stack`.
 | `WH_DELIVER_LEASE` | `60s` | Lease on a claimed delivery; must exceed the timeout; heartbeats renew it every third |
 | `WH_DELIVER_DRAIN` | `15s` | On shutdown, how long in-flight requests may finish before they are cancelled |
 | `WH_REAP_INTERVAL` | `5s` | How often expired leases are swept (at least `100ms`) |
+| `WH_BREAKER_FAILURES` | `5` | Consecutive transient failures that open an endpoint's circuit breaker |
+| `WH_BREAKER_OPEN_FOR` | `30s` | First open period; it doubles after each failed probe |
+| `WH_BREAKER_MAX_OPEN_FOR` | `15m` | Cap on the open period |
+| `WH_BREAKER_PROBE_TIMEOUT` | `2m` | How long a half-open probe may stay silent before another is sent; must exceed `WH_DELIVER_TIMEOUT` |
 
 Invalid configuration is reported all at once at startup, without echoing
 the database URL (it holds a password).
@@ -389,6 +393,61 @@ address on another, one event fanned out to both; the first delivery was
 `delivered` with a verified signature, the second `pending` with
 `transport: … connection refused` and a retry scheduled.
 
+## Circuit breaker
+
+A receiver that is down turns every pending delivery to it into a
+failed attempt, a retry and a log line, and burns deliverer slots that
+other endpoints need. `internal/breaker` stops that per endpoint:
+
+```
+closed ──5 consecutive transient failures──▶ open ──period elapsed──▶ half-open
+  ▲                                            ▲                        │
+  │                                            │ probe fails:           │ one probe
+  └────── success, or a 4xx on the probe ──────┴── period doubles ◀─────┘
+```
+
+Only *transient* outcomes count (5xx, 429, timeouts, connection errors):
+a 4xx is the receiver answering, so it never opens the breaker, and a
+4xx on the probe closes it. The open period starts at
+`WH_BREAKER_OPEN_FOR` and doubles after each failed probe up to
+`WH_BREAKER_MAX_OPEN_FOR`, so a receiver that is down for hours is
+probed less and less often. Any success closes the breaker and clears
+the counters.
+
+**Shared state.** The breaker lives on the endpoint row
+(`breaker_status`, `breaker_failures`, `breaker_opens`,
+`breaker_opened_until`, `breaker_probe_until`, with CHECK constraints
+that restate the invariants), so N gateway instances see one breaker
+rather than each tripping its own after N× the failures. Two places touch
+it, both inside transactions the store already runs:
+
+- **Claim** joins the endpoint and leaves out deliveries whose breaker is
+  plainly shut. For an endpoint whose open period or probe timeout has
+  elapsed it locks the endpoint row with `FOR UPDATE SKIP LOCKED`, lets
+  exactly one delivery through as the probe and marks the breaker
+  half-open with a probe deadline; a competing claimer finds the row
+  locked, or already half-open, and claims nothing from that endpoint.
+  `TestBreakerConcurrentClaimersElectOneProbe` races 12 claimers for
+  20 due deliveries behind an elapsed breaker: one goes out.
+- **Finish** feeds the outcome to the breaker in the same transaction as
+  the delivery transition, locking the delivery row first and the
+  endpoint row second, always in that order, so deliverers finishing
+  against one endpoint queue rather than deadlock. An outcome that
+  arrives after the breaker opened (an attempt that was already in
+  flight) changes nothing.
+
+A pending delivery behind an open breaker is not touched: it stays due,
+and the claim scan simply skips it until the breaker admits traffic
+again, so nothing is lost and no attempt is spent. `Store.ResetBreaker`
+closes a breaker by hand after a receiver is fixed.
+
+Checked against the real binaries with a receiver that answers 503:
+six deliveries went out at once and all failed; the third failure opened
+the breaker and the other three reports changed nothing; the first probe
+failed and the period doubled from 5 s to 10 s; once the receiver was
+switched to 200 the next probe closed the breaker and the remaining five
+were delivered, 13 attempts in all instead of a retry storm.
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
@@ -396,7 +455,7 @@ address on another, one event fanned out to both; the first delivery was
 - [x] **Day 3**: HMAC signing: `Webhook-Signature` / `-Timestamp` / `-Id` headers; secret rotation with an overlap window; reference receiver with replay protection
 - [x] **Day 4**: Schema and store: endpoints, events, deliveries; fan-out of one event to every enabled endpoint; idempotency keys; `SKIP LOCKED` claims
 - [x] **Day 5**: Deliverer: HTTP client with timeouts, body limits, no redirects; scheduled retries; dead-letter after the last attempt
-- [ ] **Day 6**: Per-endpoint circuit breaker with state in PostgreSQL shared by all instances; half-open probes
+- [x] **Day 6**: Per-endpoint circuit breaker with state in PostgreSQL shared by all instances; half-open probes
 - [ ] **Day 7**: SSRF protection (private, loopback and link-local ranges, pinned DNS); per-endpoint rate limit; optional in-order delivery per endpoint
 - [ ] **Day 8**: Customer API: delivery history with response snippets, replay, pause and resume endpoints; end-to-end tests against the reference receiver
 - [ ] **Day 9**: Metrics (success rate and latency per endpoint, backlog, breaker states), alerts, benchmarks
