@@ -9,10 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"time"
 
+	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/egress"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/event"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/signing"
 )
@@ -36,8 +36,9 @@ type Request struct {
 
 // Sender makes one signed POST per attempt. It never follows redirects:
 // a redirect would send a signed request, secret-bound, to a host the
-// customer did not register. The dialer and TLS settings of Client are
-// where day 7 adds the address checks.
+// customer did not register. Every connection goes through an
+// egress.Dialer, so a URL whose host resolves into the gateway's own
+// network is refused at the socket, whatever DNS says at that moment.
 type Sender struct {
 	client *http.Client
 	now    func() time.Time
@@ -45,14 +46,19 @@ type Sender struct {
 
 // NewSender returns a Sender whose requests time out after timeout, end
 // to end (dial, TLS, request, response headers and body). A receiver
-// slower than that gets a Retry; it had its chance.
-func NewSender(timeout time.Duration) *Sender {
+// slower than that gets a Retry; it had its chance. policy decides
+// which addresses may be connected to; a refused destination is a
+// Blocked outcome, final, since no retry changes where a host points.
+func NewSender(timeout time.Duration, policy egress.Policy) *Sender {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
+	dialer := &egress.Dialer{Policy: policy, Timeout: 5 * time.Second}
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		// No proxy from the environment: a proxy would resolve and
+		// connect on the gateway's behalf, past the egress check.
+		Proxy:                 nil,
+		DialContext:           dialer.DialContext,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: timeout,
 		MaxIdleConns:          100,
@@ -95,6 +101,9 @@ func (s *Sender) Send(ctx context.Context, r Request) event.Result {
 
 	resp, err := s.client.Do(req)
 	if err != nil {
+		if errors.Is(err, egress.ErrDenied) {
+			err = fmt.Errorf("%w: %w", event.ErrBlocked, err)
+		}
 		return event.Result{Outcome: event.ClassifyError(err), Error: event.Describe(0, nil, err)}
 	}
 	defer resp.Body.Close()

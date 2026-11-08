@@ -4,9 +4,11 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -48,6 +50,13 @@ type Config struct {
 	// BreakerProbeTimeout is how long a half-open probe may stay silent
 	// before another probe is allowed.
 	BreakerProbeTimeout time.Duration
+
+	// EgressAllow lists networks deliveries may reach even though they
+	// are private, loopback or otherwise reserved: receivers inside the
+	// same VPC, or the loopback in development. Empty in production.
+	EgressAllow []netip.Prefix
+	// EgressPorts, when set, is the only ports receivers may listen on.
+	EgressPorts []int
 }
 
 // Load reads configuration from environment variables, applying defaults
@@ -159,6 +168,35 @@ func load(getenv func(string) string) (Config, error) {
 	if cfg.DeliverLease <= cfg.DeliverTimeout {
 		errs = append(errs, errors.New("WH_DELIVER_LEASE: must be longer than WH_DELIVER_TIMEOUT, or a slow receiver could get a request twice"))
 	}
+	if raw := getenv("WH_EGRESS_ALLOW"); raw != "" {
+		for _, item := range strings.Split(raw, ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			p, err := netip.ParsePrefix(item)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("WH_EGRESS_ALLOW: %q is not a CIDR prefix", item))
+				continue
+			}
+			cfg.EgressAllow = append(cfg.EgressAllow, p.Masked())
+		}
+	}
+	if raw := getenv("WH_EGRESS_PORTS"); raw != "" {
+		for _, item := range strings.Split(raw, ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			n, err := strconv.Atoi(item)
+			if err != nil || n < 1 || n > 65535 {
+				errs = append(errs, fmt.Errorf("WH_EGRESS_PORTS: %q is not a port", item))
+				continue
+			}
+			cfg.EgressPorts = append(cfg.EgressPorts, n)
+		}
+	}
+
 	if cfg.BreakerMaxOpenFor < cfg.BreakerOpenFor {
 		errs = append(errs, errors.New("WH_BREAKER_MAX_OPEN_FOR: must be at least WH_BREAKER_OPEN_FOR"))
 	}

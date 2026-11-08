@@ -16,6 +16,7 @@ import (
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/breaker"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/config"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/deliverer"
+	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/egress"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/httpapi"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/postgres"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/reaper"
@@ -86,7 +87,7 @@ func run() error {
 	// parallel with the HTTP drain, and are awaited before the database
 	// handle closes, so every in-flight request is reported.
 	if cfg.DeliverConcurrency > 0 {
-		pool, err := deliverer.New(store, deliverer.NewSender(cfg.DeliverTimeout), logger, deliverer.Options{
+		pool, err := deliverer.New(store, deliverer.NewSender(cfg.DeliverTimeout, egress.Policy{Allow: cfg.EgressAllow, Ports: cfg.EgressPorts}), logger, deliverer.Options{
 			Concurrency:  cfg.DeliverConcurrency,
 			Lease:        cfg.DeliverLease,
 			DrainTimeout: cfg.DeliverDrain,

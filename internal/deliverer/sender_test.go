@@ -6,11 +6,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/egress"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/event"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/signing"
 )
@@ -18,6 +20,11 @@ import (
 const secret = "whsec_0123456789abcdef0123456789abcdef"
 
 var body = []byte(`{"type":"order.paid","data":{"id":42}}`)
+
+// loopback lets the tests' httptest servers through the egress guard.
+var loopback = egress.Policy{Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}}
+
+func newTestSender(timeout time.Duration) *Sender { return NewSender(timeout, loopback) }
 
 func request(url string) Request {
 	return Request{DeliveryID: 17, EventType: "order.paid", Body: body, URL: url, Secrets: []string{secret}}
@@ -37,7 +44,7 @@ func TestSendSignsAndReportsStatus(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewSender(2 * time.Second)
+	s := newTestSender(2 * time.Second)
 	res := s.Send(context.Background(), request(srv.URL+"/hook"))
 	if res.Outcome != event.Delivered || res.Status != 204 || res.Error != "" {
 		t.Fatalf("result = %+v", res)
@@ -88,7 +95,7 @@ func TestSendClassifiesResponses(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			srv := httptest.NewServer(tt.handler)
 			defer srv.Close()
-			res := NewSender(2*time.Second).Send(context.Background(), request(srv.URL))
+			res := newTestSender(2*time.Second).Send(context.Background(), request(srv.URL))
 			if res.Outcome != tt.outcome || res.Status != tt.status || !strings.HasPrefix(res.Error, tt.errPart) {
 				t.Fatalf("result = %+v, want %v/%d/%q", res, tt.outcome, tt.status, tt.errPart)
 			}
@@ -110,7 +117,7 @@ func TestSendTransportFailures(t *testing.T) {
 	defer slow.Close()
 
 	start := time.Now()
-	res := NewSender(100*time.Millisecond).Send(context.Background(), request(slow.URL))
+	res := newTestSender(100*time.Millisecond).Send(context.Background(), request(slow.URL))
 	if res.Outcome != event.Retry || res.Status != 0 || !strings.HasPrefix(res.Error, "timeout: ") {
 		t.Fatalf("timeout: %+v", res)
 	}
@@ -118,23 +125,23 @@ func TestSendTransportFailures(t *testing.T) {
 		t.Fatalf("timeout took %v", time.Since(start))
 	}
 
-	res = NewSender(time.Second).Send(context.Background(), request("http://127.0.0.1:1/hook"))
+	res = newTestSender(time.Second).Send(context.Background(), request("http://127.0.0.1:1/hook"))
 	if res.Outcome != event.Retry || !strings.HasPrefix(res.Error, "transport: ") {
 		t.Fatalf("refused: %+v", res)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	res = NewSender(time.Second).Send(ctx, request(slow.URL))
+	res = newTestSender(time.Second).Send(ctx, request(slow.URL))
 	if res.Outcome != event.Retry || !strings.HasPrefix(res.Error, "canceled: ") {
 		t.Fatalf("cancelled: %+v", res)
 	}
 
-	res = NewSender(time.Second).Send(context.Background(), Request{DeliveryID: 1, URL: slow.URL, Body: body})
+	res = newTestSender(time.Second).Send(context.Background(), Request{DeliveryID: 1, URL: slow.URL, Body: body})
 	if res.Outcome != event.Blocked || !strings.Contains(res.Error, "no secrets") {
 		t.Fatalf("no secrets: %+v", res)
 	}
-	res = NewSender(time.Second).Send(context.Background(), Request{DeliveryID: 1, URL: "::not a url", Body: body, Secrets: []string{secret}})
+	res = newTestSender(time.Second).Send(context.Background(), Request{DeliveryID: 1, URL: "::not a url", Body: body, Secrets: []string{secret}})
 	if res.Outcome != event.Blocked {
 		t.Fatalf("bad url: %+v", res)
 	}
@@ -154,7 +161,7 @@ func TestSendReusesConnections(t *testing.T) {
 	srv.Start()
 	defer srv.Close()
 
-	s := NewSender(time.Second)
+	s := newTestSender(time.Second)
 	for i := 0; i < 5; i++ {
 		if res := s.Send(context.Background(), request(srv.URL)); res.Outcome != event.Delivered {
 			t.Fatalf("send %d: %+v", i, res)
@@ -163,5 +170,36 @@ func TestSendReusesConnections(t *testing.T) {
 	// Bodies are drained, so the transport can keep the connection.
 	if n := conns.Load(); n != 1 {
 		t.Fatalf("%d connections for 5 sends, want 1", n)
+	}
+}
+
+func TestSendBlocksDestinationsTheEgressPolicyRefuses(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	port := srv.URL[len("http://127.0.0.1:"):]
+
+	strict := NewSender(time.Second, egress.Policy{})
+	for _, url := range []string{srv.URL, "http://localhost:" + port + "/hook", "http://[::1]:" + port + "/hook", "http://169.254.169.254/latest/meta-data/"} {
+		res := strict.Send(context.Background(), request(url))
+		if res.Outcome != event.Blocked || !strings.Contains(res.Error, "not allowed") {
+			t.Fatalf("%s: %+v, want blocked by the egress policy", url, res)
+		}
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("the guarded sender reached the loopback server %d times", hits.Load())
+	}
+	// The same request with the loopback allowed goes through, so it was
+	// the policy that blocked it, not the URL.
+	if res := newTestSender(time.Second).Send(context.Background(), request(srv.URL)); res.Outcome != event.Delivered || hits.Load() != 1 {
+		t.Fatalf("permissive sender: %+v, hits %d", res, hits.Load())
+	}
+	// A port outside the policy's list is refused before any connection.
+	ports := NewSender(time.Second, egress.Policy{Allow: loopback.Allow, Ports: []int{443}})
+	if res := ports.Send(context.Background(), request(srv.URL)); res.Outcome != event.Blocked || hits.Load() != 1 {
+		t.Fatalf("port policy: %+v, hits %d", res, hits.Load())
 	}
 }

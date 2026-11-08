@@ -1,6 +1,8 @@
 package config
 
 import (
+	"net/netip"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -33,7 +35,7 @@ func TestLoadDefaults(t *testing.T) {
 		BreakerMaxOpenFor:   15 * time.Minute,
 		BreakerProbeTimeout: 2 * time.Minute,
 	}
-	if cfg != want {
+	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("got %+v, want %+v", cfg, want)
 	}
 }
@@ -56,6 +58,8 @@ func TestLoadOverrides(t *testing.T) {
 		"WH_BREAKER_OPEN_FOR":      "10s",
 		"WH_BREAKER_MAX_OPEN_FOR":  "1m",
 		"WH_BREAKER_PROBE_TIMEOUT": "20s",
+		"WH_EGRESS_ALLOW":          "127.0.0.0/8, 10.1.2.3/16",
+		"WH_EGRESS_PORTS":          "443, 8443",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -67,6 +71,10 @@ func TestLoadOverrides(t *testing.T) {
 		cfg.BreakerFailures != 3 || cfg.BreakerOpenFor != 10*time.Second || cfg.BreakerMaxOpenFor != time.Minute ||
 		cfg.BreakerProbeTimeout != 20*time.Second {
 		t.Fatalf("unexpected config %+v", cfg)
+	}
+	wantAllow := []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("10.1.0.0/16")}
+	if !reflect.DeepEqual(cfg.EgressAllow, wantAllow) || !reflect.DeepEqual(cfg.EgressPorts, []int{443, 8443}) {
+		t.Fatalf("egress = %v %v, want %v [443 8443] (prefixes masked)", cfg.EgressAllow, cfg.EgressPorts, wantAllow)
 	}
 }
 
@@ -119,6 +127,15 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 				"WH_BREAKER_PROBE_TIMEOUT": "5s",
 			},
 			want: []string{"WH_BREAKER_FAILURES", "WH_BREAKER_MAX_OPEN_FOR: must be at least", "WH_BREAKER_PROBE_TIMEOUT: must be longer"},
+		},
+		{
+			name: "egress settings",
+			env: map[string]string{
+				"WH_DATABASE_URL": "postgres://localhost/webhooks",
+				"WH_EGRESS_ALLOW": "10.0.0.1,10.0.0.0/8",
+				"WH_EGRESS_PORTS": "443,99999",
+			},
+			want: []string{`WH_EGRESS_ALLOW: "10.0.0.1" is not a CIDR prefix`, `WH_EGRESS_PORTS: "99999" is not a port`},
 		},
 		{
 			name: "every error is reported at once",
