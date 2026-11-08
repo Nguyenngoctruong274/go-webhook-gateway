@@ -52,20 +52,22 @@ flowchart LR
     O[Operators / customers] -->|GET /v1/deliveries, replay| API
 ```
 
-The diagram is the target design; the [roadmap](#roadmap) shows what is
-built so far.
+Everything in the diagram is built except the metrics and the
+hardening of the last two days; the [roadmap](#roadmap) has the detail.
 
 | Package | Responsibility |
 |---|---|
 | `cmd/webhookd` | Service wiring, graceful shutdown |
-| `cmd/webhook-receiver` | Reference receiver: verifies signatures, ignores duplicate deliveries, asks for retries on failure |
+| `cmd/webhook-receiver` | Serves `internal/receiver`, the reference receiver: verifies signatures, ignores duplicate deliveries, asks for retries on failure |
 | `internal/config` | Environment configuration with validation |
-| `internal/httpapi` | Probes now; endpoints, events and deliveries later |
+| `internal/httpapi` | Probes and the customer API under `/v1`: endpoints, events, delivery history, replay and cancel; bearer token; JSON errors with codes |
 | `internal/event` | Domain: events, endpoints, deliveries; outcome classification; delivery state machine with fenced attempts; retry backoff with jitter (no I/O) |
 | `internal/signing` | HMAC-SHA256 signing headers, verification with constant-time compare and timestamp tolerance, secret rotation with overlap |
 | `internal/postgres` | Connection pool, embedded migrations, store: endpoints with secret rotation, events fanned out to deliveries with idempotency keys, deliveries claimed with `SKIP LOCKED` and finished under a fencing token |
 | `internal/deliverer` | Sender: one signed POST per attempt with timeouts, bounded response reads, no redirects; Pool: bounded concurrency, heartbeats, drain |
 | `internal/reaper` | Timer loop that returns silent deliverers' deliveries to the queue |
+| `internal/receiver` | Reference receiver handler, mounted by the binary and by the end-to-end tests |
+| `internal/e2e` | End-to-end tests: API → store → deliverer → reference receiver, in one process against PostgreSQL |
 | `internal/breaker` | Per-endpoint circuit breaker: closed / open / half-open as a pure value; the store keeps one per endpoint so every instance sees the same breaker |
 | `internal/egress` | SSRF guard: resolves a receiver's host, refuses private, loopback, link-local and other reserved addresses, and connects to the address it checked |
 | `internal/testdb` | Isolated PostgreSQL schema per test |
@@ -80,6 +82,25 @@ curl localhost:8080/readyz    # {"status":"ready"}; 503 if PostgreSQL is down
 make test-db     # unit tests + tests against the real PostgreSQL
 ```
 
+Then register a receiver and publish an event:
+
+```bash
+# A receiver on the host (the secret comes from the next call)
+RECEIVER_SECRETS=whsec_... RECEIVER_ADDR=:9000 go run ./cmd/webhook-receiver
+
+J='Content-Type: application/json'
+curl -s localhost:8080/v1/endpoints -H "$J" -d '{"url":"http://127.0.0.1:9000/webhook","types":["order.paid"]}'
+# → {"id":1,"url":...,"secret":"whsec_..."}   (the secret is shown once)
+curl -s localhost:8080/v1/events -H "$J" -H 'Idempotency-Key: order-42-paid' \
+  -d '{"type":"order.paid","payload":{"order":42,"amount":"10.00"}}'
+# → {"event":{...},"created":true,"deliveries":1}
+curl -s localhost:8080/v1/endpoints/1/deliveries
+# → {"items":[{"id":1,"state":"delivered","attempt":1,"last_status":200,...}]}
+```
+
+For a receiver on the loopback, start webhookd with
+`WH_EGRESS_ALLOW=127.0.0.0/8` (see the egress guard below).
+
 webhookd applies pending migrations at startup, under an advisory lock so
 that several instances starting together migrate once.
 
@@ -93,6 +114,7 @@ Or run everything in containers: `make stack`.
 | `WH_DB_MAX_CONNS` | `20` | Maximum open database connections (API and deliverers share them) |
 | `WH_HTTP_ADDR` | `:8080` | Listen address |
 | `WH_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `WH_API_TOKEN` | *(empty)* | Bearer token every `/v1` request must carry (at least 16 characters). Empty leaves the API open: local development only |
 | `WH_SHUTDOWN_TIMEOUT` | `15s` | Maximum time to finish in-flight requests |
 | `WH_SHUTDOWN_DRAIN` | `0` | Time `/readyz` reports 503 before the listener closes |
 | `WH_DELIVER_CONCURRENCY` | `16` | Requests in flight at once on this instance, `0` to `1000`; `0` runs no deliverers |
@@ -525,6 +547,50 @@ cursor and order are applied in memory and written back once. Nothing
 is claimed by two instances, no credit is spent twice, and no two probes
 or two heads of an ordered queue go out together.
 
+## API
+
+Everything under `/v1` is JSON and, when `WH_API_TOKEN` is set, needs
+`Authorization: Bearer <token>`. The probes stay open. Errors are
+`{"error":{"code":"...","message":"..."}}` with `invalid` (400, 413,
+415), `unauthorized` (401), `not_found` (404), `conflict` (409) or
+`internal` (500, with the request id to search the logs by). Validation
+reports every problem at once.
+
+| Method and path | Does |
+|---|---|
+| `POST /v1/endpoints` | Register a receiver: `url`, `description`, `types` (empty = all), `max_attempts` (1–20, default 8), `rate_limit` (per second, 0 = none), `ordered`. Returns the endpoint **and its secret, once**. |
+| `GET /v1/endpoints` | List endpoints, oldest first. |
+| `GET /v1/endpoints/{id}` | One endpoint with its breaker and delivery counts by state. |
+| `PUT /v1/endpoints/{id}` | Replace the settings (same body as create). Queued deliveries keep the `max_attempts` they were created with. |
+| `POST /v1/endpoints/{id}/pause`, `/resume` | A paused endpoint takes part in no fan-out; deliveries already queued are still attempted, so pausing never drops an accepted event. |
+| `POST /v1/endpoints/{id}/secret` | Rotate the secret; `{"overlap":"24h"}` (default, at most 7 days) keeps the old one verifying while the receiver switches. Deliveries carry both signatures during the overlap. |
+| `GET` / `DELETE /v1/endpoints/{id}/breaker` | Read, or reset, the circuit breaker. |
+| `GET /v1/endpoints/{id}/deliveries` | Delivery history, newest first: `state`, `attempt`, `last_status`, `last_error` (the response excerpt), `delivered_at`. `?state=`, `?limit=` (≤ 200), `?before=<id>` for the next page; `next_before` in the answer says where it starts. |
+| `POST /v1/events` | Publish: `type`, `payload` (a JSON object or array, ≤ 256 KiB), `idempotency_key` or the `Idempotency-Key` header. 201 with the number of deliveries fanned out; 200 and the existing event when the key was seen; 409 when the key was used for a different event. |
+| `GET /v1/events/{id}` | The event with its deliveries. |
+| `GET /v1/deliveries/{id}` | One delivery. |
+| `POST /v1/deliveries/{id}/replay` | Queue a finished delivery (delivered, failed, rejected, blocked or cancelled) again with fresh attempts; 409 while it is pending or in flight. Receivers deduplicate by `Webhook-Id`, so replaying a delivered one is safe. |
+| `POST /v1/deliveries/{id}/cancel` | Stop a pending delivery; 409 when it is in flight (the request may be on the wire) or already finished. |
+
+Bodies are decoded with unknown fields refused and a size cap, so a
+typo in a field name is a 400 rather than a silently ignored setting.
+The wire types live in `internal/httpapi/dto.go`, apart from the domain
+types, so renaming a Go field never changes what customers parse.
+
+**End to end.** `internal/e2e` starts the API, a deliverer pool with the
+real sender and the reference receiver in one process against
+PostgreSQL and walks through a customer's day: register, point the
+receiver at the secret, publish and see the body arrive byte for byte
+with a signature the receiver accepts; an unsubscribed type fans out
+to nobody; the receiver's handler fails and the gateway records
+`HTTP 500`, retries after the backoff and succeeds once it recovers; a
+replay of a delivered event reaches the receiver, which recognises the
+`Webhook-Id` and answers 200 without handling it twice; pause stops
+fan-out and resume restores it; the history and the endpoint counts
+agree; a rotated secret keeps deliveries verifying through the overlap.
+A second test registers a private address and sees the delivery end as
+`blocked` at the socket.
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
@@ -534,7 +600,7 @@ or two heads of an ordered queue go out together.
 - [x] **Day 5**: Deliverer: HTTP client with timeouts, body limits, no redirects; scheduled retries; dead-letter after the last attempt
 - [x] **Day 6**: Per-endpoint circuit breaker with state in PostgreSQL shared by all instances; half-open probes
 - [x] **Day 7**: SSRF protection (private, loopback and link-local ranges, pinned DNS); per-endpoint rate limit; optional in-order delivery per endpoint
-- [ ] **Day 8**: Customer API: delivery history with response snippets, replay, pause and resume endpoints; end-to-end tests against the reference receiver
+- [x] **Day 8**: Customer API: delivery history with response snippets, replay, pause and resume endpoints; end-to-end tests against the reference receiver
 - [ ] **Day 9**: Metrics (success rate and latency per endpoint, backlog, breaker states), alerts, benchmarks
 - [ ] **Day 10**: Final README, design decisions, Docker stack (webhookd, receiver, Prometheus), v1.0.0
 

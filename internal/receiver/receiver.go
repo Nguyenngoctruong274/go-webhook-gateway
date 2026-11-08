@@ -1,4 +1,7 @@
-package main
+// Package receiver is the reference implementation of a webhook
+// receiver: verify the signature, ignore duplicates, ask for a retry on
+// failure. cmd/webhook-receiver serves it; the end-to-end tests mount it.
+package receiver
 
 import (
 	"io"
@@ -29,8 +32,8 @@ type Receiver struct {
 	seen map[int64]time.Time
 }
 
-// NewReceiver returns a receiver that accepts signatures under secrets.
-func NewReceiver(secrets []string, logger *slog.Logger) *Receiver {
+// New returns a receiver that accepts signatures under secrets.
+func New(secrets []string, logger *slog.Logger) *Receiver {
 	return &Receiver{
 		verifier: signing.Verifier{Secrets: secrets},
 		logger:   logger,

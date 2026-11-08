@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/receiver"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/signing"
 )
 
@@ -46,7 +47,7 @@ func run() error {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	rc := NewReceiver(secrets, logger)
+	rc := receiver.New(secrets, logger)
 	rc.Handle = func(id int64, body []byte) error {
 		logger.Info("event", slog.Int64("delivery_id", id), slog.String("body", string(body)))
 		return nil

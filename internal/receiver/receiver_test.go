@@ -1,4 +1,4 @@
-package main
+package receiver
 
 import (
 	"bytes"
@@ -38,7 +38,7 @@ func serve(rc *Receiver, req *http.Request) int {
 }
 
 func TestReceiverAcceptsOnceAndIgnoresDuplicates(t *testing.T) {
-	rc := NewReceiver([]string{secret}, quiet)
+	rc := New([]string{secret}, quiet)
 	var handled []int64
 	rc.Handle = func(id int64, _ []byte) error { handled = append(handled, id); return nil }
 	now := time.Now()
@@ -59,7 +59,7 @@ func TestReceiverAcceptsOnceAndIgnoresDuplicates(t *testing.T) {
 }
 
 func TestReceiverRejectsForgeriesWithOneCode(t *testing.T) {
-	rc := NewReceiver([]string{secret}, quiet)
+	rc := New([]string{secret}, quiet)
 	rc.Handle = func(int64, []byte) error { t.Fatal("handler ran on a rejected request"); return nil }
 	now := time.Now()
 
@@ -84,7 +84,7 @@ func TestReceiverRejectsForgeriesWithOneCode(t *testing.T) {
 }
 
 func TestReceiverAsksForRetryWhenHandlingFails(t *testing.T) {
-	rc := NewReceiver([]string{secret}, quiet)
+	rc := New([]string{secret}, quiet)
 	calls := 0
 	rc.Handle = func(int64, []byte) error {
 		calls++
@@ -105,7 +105,7 @@ func TestReceiverAsksForRetryWhenHandlingFails(t *testing.T) {
 
 func TestReceiverAcceptsBothSecretsDuringRotation(t *testing.T) {
 	old, cur := "whsec_oldoldoldoldoldoldoldoldoldoldold", secret
-	rc := NewReceiver([]string{cur, old}, quiet)
+	rc := New([]string{cur, old}, quiet)
 	now := time.Now()
 	if code := serve(rc, signed(t, []string{old}, 1, now, `{}`)); code != 200 {
 		t.Fatalf("signed with the old secret: %d", code)
@@ -116,7 +116,7 @@ func TestReceiverAcceptsBothSecretsDuringRotation(t *testing.T) {
 }
 
 func TestSeenSetIsBounded(t *testing.T) {
-	rc := NewReceiver([]string{secret}, quiet)
+	rc := New([]string{secret}, quiet)
 	// Plant an entry older than the window; the next request sweeps it.
 	rc.seen[99] = time.Now().Add(-time.Hour)
 	serve(rc, signed(t, []string{secret}, 1, time.Now(), `{}`))
