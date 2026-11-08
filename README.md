@@ -67,6 +67,7 @@ built so far.
 | `internal/deliverer` | Sender: one signed POST per attempt with timeouts, bounded response reads, no redirects; Pool: bounded concurrency, heartbeats, drain |
 | `internal/reaper` | Timer loop that returns silent deliverers' deliveries to the queue |
 | `internal/breaker` | Per-endpoint circuit breaker: closed / open / half-open as a pure value; the store keeps one per endpoint so every instance sees the same breaker |
+| `internal/egress` | SSRF guard: resolves a receiver's host, refuses private, loopback, link-local and other reserved addresses, and connects to the address it checked |
 | `internal/testdb` | Isolated PostgreSQL schema per test |
 
 ## Quick start
@@ -103,6 +104,8 @@ Or run everything in containers: `make stack`.
 | `WH_BREAKER_OPEN_FOR` | `30s` | First open period; it doubles after each failed probe |
 | `WH_BREAKER_MAX_OPEN_FOR` | `15m` | Cap on the open period |
 | `WH_BREAKER_PROBE_TIMEOUT` | `2m` | How long a half-open probe may stay silent before another is sent; must exceed `WH_DELIVER_TIMEOUT` |
+| `WH_EGRESS_ALLOW` | *(empty)* | Comma-separated CIDRs deliveries may reach although they are private or reserved (receivers in the same VPC; `127.0.0.0/8` in development). Keep empty in production |
+| `WH_EGRESS_PORTS` | *(any)* | Comma-separated ports receivers may listen on, e.g. `443,8443` |
 
 Invalid configuration is reported all at once at startup, without echoing
 the database URL (it holds a password).
@@ -448,6 +451,80 @@ failed and the period doubled from 5 s to 10 s; once the receiver was
 switched to 200 the next probe closed the breaker and the remaining five
 were delivered, 13 attempts in all instead of a retry storm.
 
+## Egress guard (SSRF)
+
+A customer registers any URL. If `https://hooks.example/in` resolved to
+`10.0.0.5` or `169.254.169.254`, the gateway would POST a signed request
+into its own network — the metadata service, an internal admin API, a
+database's HTTP port — on the customer's behalf. `internal/egress` closes
+that at the socket, not at registration:
+
+- **Checked at connect time, against the resolved address.** Validating
+  the host name when the endpoint is created proves nothing: DNS can
+  change later, and `localhost`, `127.1`, `0x7f000001`,
+  `::ffff:127.0.0.1` and a public name with a private A record all look
+  harmless as strings. The `Dialer` resolves the host, checks every
+  address, and connects to the **IP it checked**, never to the name
+  again, so a resolver that answers a public address first and a private
+  one on the next lookup (DNS rebinding) gets nowhere.
+- **Denied by default**: loopback, the private ranges, link-local (the
+  cloud metadata address lives there), carrier-grade NAT, multicast,
+  unspecified, documentation and benchmarking ranges, and the IPv6
+  forms that smuggle an IPv4 (mapped, NAT64, 6to4, Teredo). Addresses
+  are unmapped before the check.
+- **No environment proxy.** `HTTP_PROXY` would make the proxy resolve and
+  connect on the gateway's behalf, past the check, so the sender ignores
+  it. Redirects were already not followed.
+- **A refused destination is a `blocked` outcome**: final, not retried,
+  with the reason in the delivery history (`destination not allowed:
+  10.0.0.5 is in 10.0.0.0/8`).
+
+`WH_EGRESS_ALLOW` punches holes for receivers that legitimately sit in
+a private network (the compose stack sets it so a receiver run on the
+host or on the Docker network is reachable from the container); `WH_EGRESS_PORTS` can pin receivers
+to 443. Tests resolve through a fake resolver with one private and one
+loopback answer per name and assert which address the listener saw and
+that one dial makes one lookup.
+
+## Rate limit and ordering per endpoint
+
+Two more things the endpoint row decides, next to the breaker, so every
+instance enforces the same cap and the same order:
+
+- **Rate limit** (`rate_limit` per second, 0 = none, at most 1000). The
+  row carries a cursor: the time the next delivery may be claimed. Each
+  admitted delivery moves it forward by `1/rate`, and the claim scan never
+  starts the cursor further back than one second ago, so an idle
+  endpoint has at most one second's worth of burst. A receiver that
+  asked for 10/s gets 10 at once after a quiet spell, then 10 per second
+  however many instances claim and however large their batches:
+  `TestRateLimitIsSharedByConcurrentClaimers` has 8 claimers ask for 100
+  each at the same instant and come away with 10 between them.
+- **Ordered delivery** (`ordered`). One delivery in flight at a time,
+  the oldest first; a delivery that is retrying holds the ones behind
+  it until it is delivered or spent, and a dead-lettered one stops
+  holding the line. The scan excludes a delivery with an older pending
+  or in-flight sibling (`deliveries_open_by_endpoint` answers that
+  without reading the history), and the gate admits one per claim.
+  Ordering costs throughput: the next delivery is claimed on the next
+  claim cycle after the previous one finishes, so one instance moves an
+  ordered endpoint at about one delivery per `PollInterval` (1 s). It is
+  off by default and meant for endpoints whose events are state
+  transitions (`order.paid` before `order.shipped`); a wake-up on finish
+  is on the list for the metrics day.
+
+Checked against the real binaries: 30 events to an endpoint limited to
+5/s were delivered 5 in the first second and 5 in each second after;
+6 events to an ordered endpoint went out one per second, in id order.
+
+All three gates share one mechanism in `Claim`: deliveries to endpoints
+that need no gating are claimed straight from the `SKIP LOCKED` scan;
+for the rest the endpoint row is locked once (`FOR UPDATE SKIP LOCKED`,
+so a row another instance is deciding is left to it), the breaker,
+cursor and order are applied in memory and written back once. Nothing
+is claimed by two instances, no credit is spent twice, and no two probes
+or two heads of an ordered queue go out together.
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
@@ -456,7 +533,7 @@ were delivered, 13 attempts in all instead of a retry storm.
 - [x] **Day 4**: Schema and store: endpoints, events, deliveries; fan-out of one event to every enabled endpoint; idempotency keys; `SKIP LOCKED` claims
 - [x] **Day 5**: Deliverer: HTTP client with timeouts, body limits, no redirects; scheduled retries; dead-letter after the last attempt
 - [x] **Day 6**: Per-endpoint circuit breaker with state in PostgreSQL shared by all instances; half-open probes
-- [ ] **Day 7**: SSRF protection (private, loopback and link-local ranges, pinned DNS); per-endpoint rate limit; optional in-order delivery per endpoint
+- [x] **Day 7**: SSRF protection (private, loopback and link-local ranges, pinned DNS); per-endpoint rate limit; optional in-order delivery per endpoint
 - [ ] **Day 8**: Customer API: delivery history with response snippets, replay, pause and resume endpoints; end-to-end tests against the reference receiver
 - [ ] **Day 9**: Metrics (success rate and latency per endpoint, backlog, breaker states), alerts, benchmarks
 - [ ] **Day 10**: Final README, design decisions, Docker stack (webhookd, receiver, Prometheus), v1.0.0
