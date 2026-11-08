@@ -26,6 +26,9 @@ type Config struct {
 	// closing the listener. 0 locally; a few seconds behind a load balancer.
 	ShutdownDrain time.Duration
 	LogLevel      string
+	// APIToken is the bearer token the customer API requires. Empty
+	// leaves /v1 open, for local development only.
+	APIToken string
 
 	// DeliverConcurrency is how many requests this instance has in flight
 	// at once; 0 runs no deliverers (an API-only instance).
@@ -73,6 +76,7 @@ func load(getenv func(string) string) (Config, error) {
 		DBMaxConns:      20,
 		ShutdownTimeout: 15 * time.Second,
 		LogLevel:        valueOr(getenv("WH_LOG_LEVEL"), "info"),
+		APIToken:        strings.TrimSpace(getenv("WH_API_TOKEN")),
 
 		DeliverConcurrency: 16,
 		DeliverTimeout:     10 * time.Second,
@@ -204,6 +208,9 @@ func load(getenv func(string) string) (Config, error) {
 		errs = append(errs, errors.New("WH_BREAKER_PROBE_TIMEOUT: must be longer than WH_DELIVER_TIMEOUT, or a probe still in flight would be duplicated"))
 	}
 
+	if cfg.APIToken != "" && len(cfg.APIToken) < 16 {
+		errs = append(errs, errors.New("WH_API_TOKEN: must be at least 16 characters, or empty to leave the API open"))
+	}
 	switch cfg.LogLevel {
 	case "debug", "info", "warn", "error":
 	default:

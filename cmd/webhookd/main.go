@@ -119,7 +119,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(logger, httpapi.Options{Ready: ready}),
+		Handler:           httpapi.NewHandler(logger, httpapi.Options{Ready: ready, Store: store, Token: cfg.APIToken}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

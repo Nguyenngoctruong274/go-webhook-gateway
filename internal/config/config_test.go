@@ -48,6 +48,7 @@ func TestLoadOverrides(t *testing.T) {
 		"WH_SHUTDOWN_TIMEOUT":    "30s",
 		"WH_SHUTDOWN_DRAIN":      "5s",
 		"WH_LOG_LEVEL":           "debug",
+		"WH_API_TOKEN":           " s3cret-token-of-length ",
 		"WH_DELIVER_CONCURRENCY": "0",
 		"WH_DELIVER_TIMEOUT":     "3s",
 		"WH_DELIVER_LEASE":       "20s",
@@ -63,6 +64,9 @@ func TestLoadOverrides(t *testing.T) {
 	}))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cfg.APIToken != "s3cret-token-of-length" {
+		t.Fatalf("token = %q", cfg.APIToken)
 	}
 	if cfg.HTTPAddr != "127.0.0.1:9090" || cfg.ShutdownTimeout != 30*time.Second ||
 		cfg.ShutdownDrain != 5*time.Second || cfg.LogLevel != "debug" || cfg.DBMaxConns != 50 ||
@@ -136,6 +140,11 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 				"WH_EGRESS_PORTS": "443,99999",
 			},
 			want: []string{`WH_EGRESS_ALLOW: "10.0.0.1" is not a CIDR prefix`, `WH_EGRESS_PORTS: "99999" is not a port`},
+		},
+		{
+			name: "short api token",
+			env:  map[string]string{"WH_DATABASE_URL": "postgres://localhost/webhooks", "WH_API_TOKEN": "short"},
+			want: []string{"WH_API_TOKEN: must be at least 16"},
 		},
 		{
 			name: "every error is reported at once",

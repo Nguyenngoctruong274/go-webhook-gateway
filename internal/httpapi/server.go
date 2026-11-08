@@ -1,5 +1,6 @@
-// Package httpapi exposes webhookd over HTTP. Day 1 serves the probes;
-// endpoints, events and deliveries follow.
+// Package httpapi exposes webhookd over HTTP: the probes for the
+// platform and, under /v1, the customer API for endpoints, events and
+// deliveries.
 package httpapi
 
 import (
@@ -21,21 +22,33 @@ type Options struct {
 	// Ready reports whether the service can take traffic (dependencies up,
 	// not draining). nil means always ready.
 	Ready func(context.Context) error
+	// Store backs the customer API; nil serves the probes only.
+	Store Store
+	// Token, when set, is the bearer token every /v1 request must carry.
+	Token string
 }
 
 type api struct {
 	logger *slog.Logger
 	ready  func(context.Context) error
+	store  Store
+	token  string
 }
 
 // NewHandler returns the root handler of the service.
 func NewHandler(logger *slog.Logger, opts Options) http.Handler {
-	a := &api{logger: logger, ready: opts.Ready}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	a := &api{logger: logger, ready: opts.Ready, store: opts.Store, token: opts.Token}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("GET /readyz", a.readyz)
-	return a.withRequestID(a.instrument(mux))
+	if a.store != nil {
+		a.routes(mux)
+	}
+	return a.withRequestID(a.instrument(mux, a.authenticate(mux)))
 }
 
 // healthz answers as long as the process is serving: it is a liveness probe
@@ -91,11 +104,11 @@ func (s *statusRecorder) WriteHeader(code int) {
 
 // instrument logs every request at debug level with its route pattern
 // rather than the raw path. Metrics arrive on day 9.
-func (a *api) instrument(mux *http.ServeMux) http.Handler {
+func (a *api) instrument(mux *http.ServeMux, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		mux.ServeHTTP(rec, r)
+		next.ServeHTTP(rec, r)
 		elapsed := time.Since(start)
 
 		route := "unmatched"
