@@ -135,8 +135,15 @@ type Endpoint struct {
 	// and gets nothing new until re-enabled; deliveries in flight finish.
 	Enabled     bool
 	MaxAttempts int
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// RateLimit caps deliveries to this endpoint, per second; 0 means no
+	// cap. A burst of one second's worth may go out at once.
+	RateLimit int
+	// Ordered endpoints get one delivery at a time, in the order the
+	// events were published; a delivery that is retrying holds the ones
+	// behind it until it is delivered or spent.
+	Ordered   bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // EndpointSpec is what a customer sends to register or update an endpoint.
@@ -146,7 +153,14 @@ type EndpointSpec struct {
 	Types       []string
 	// MaxAttempts per delivery; 0 means the default of 8.
 	MaxAttempts int
+	// RateLimit per second; 0 means none. At most MaxRateLimit.
+	RateLimit int
+	Ordered   bool
 }
+
+// MaxRateLimit is the highest per-second rate an endpoint may ask for;
+// above it the cap would be finer than the claim cycle can honour.
+const MaxRateLimit = 1000
 
 // DefaultMaxAttempts is used when a spec does not set one. With
 // DefaultBackoff the eighth attempt comes about 21 minutes after the
@@ -184,6 +198,9 @@ func (s EndpointSpec) Normalize() (EndpointSpec, error) {
 	}
 	if s.MaxAttempts < 1 || s.MaxAttempts > MaxAttempts {
 		errs = append(errs, fmt.Errorf("%w: max attempts must be between 1 and %d, got %d", ErrInvalid, MaxAttempts, s.MaxAttempts))
+	}
+	if s.RateLimit < 0 || s.RateLimit > MaxRateLimit {
+		errs = append(errs, fmt.Errorf("%w: rate limit must be between 0 and %d per second, got %d", ErrInvalid, MaxRateLimit, s.RateLimit))
 	}
 	if err := errors.Join(errs...); err != nil {
 		return EndpointSpec{}, err

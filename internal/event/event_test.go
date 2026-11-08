@@ -79,6 +79,13 @@ func TestEndpointSpecNormalize(t *testing.T) {
 			spec: EndpointSpec{URL: "http://localhost:9000/hook", MaxAttempts: 3, Description: "staging"},
 			want: EndpointSpec{URL: "http://localhost:9000/hook", Description: "staging", MaxAttempts: 3},
 		},
+		{
+			name: "rate limit and ordering",
+			spec: EndpointSpec{URL: "https://example.com", RateLimit: 50, Ordered: true},
+			want: EndpointSpec{URL: "https://example.com", MaxAttempts: DefaultMaxAttempts, RateLimit: 50, Ordered: true},
+		},
+		{name: "rate limit too high", spec: EndpointSpec{URL: "https://example.com", RateLimit: MaxRateLimit + 1}, wantErr: []string{"rate limit must be between 0 and 1000"}},
+		{name: "negative rate limit", spec: EndpointSpec{URL: "https://example.com", RateLimit: -1}, wantErr: []string{"rate limit"}},
 		{name: "no url", spec: EndpointSpec{}, wantErr: []string{"url is required"}},
 		{name: "ftp", spec: EndpointSpec{URL: "ftp://example.com/x"}, wantErr: []string{"scheme"}},
 		{name: "no host", spec: EndpointSpec{URL: "https:///path"}, wantErr: []string{"host"}},

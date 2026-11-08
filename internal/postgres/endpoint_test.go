@@ -100,12 +100,13 @@ func TestUpdateEndpoint(t *testing.T) {
 	assertIs(t, err, event.ErrInvalid)
 
 	got, err := s.UpdateEndpoint(ctx, ep.ID, event.EndpointSpec{
-		URL: "https://receiver.example/v2", Description: "moved", MaxAttempts: 3,
+		URL: "https://receiver.example/v2", Description: "moved", MaxAttempts: 3, RateLimit: 20, Ordered: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.URL != "https://receiver.example/v2" || got.Description != "moved" || got.MaxAttempts != 3 || len(got.Types) != 0 {
+	if got.URL != "https://receiver.example/v2" || got.Description != "moved" || got.MaxAttempts != 3 || len(got.Types) != 0 ||
+		got.RateLimit != 20 || !got.Ordered {
 		t.Fatalf("updated = %+v", got)
 	}
 	if got.UpdatedAt.Before(ep.UpdatedAt) || !got.CreatedAt.Equal(ep.CreatedAt) {

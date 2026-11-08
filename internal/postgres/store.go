@@ -55,7 +55,7 @@ type scanner interface {
 	Scan(dest ...any) error
 }
 
-const endpointColumns = `id, url, description, types, enabled, max_attempts, created_at, updated_at`
+const endpointColumns = `id, url, description, types, enabled, max_attempts, rate_limit, ordered, created_at, updated_at`
 
 // scanEndpoint reads endpointColumns, then any extra destinations, from row.
 func scanEndpoint(row scanner, extra ...any) (event.Endpoint, error) {
@@ -64,7 +64,7 @@ func scanEndpoint(row scanner, extra ...any) (event.Endpoint, error) {
 		types pq.StringArray
 	)
 	dest := append([]any{
-		&e.ID, &e.URL, &e.Description, &types, &e.Enabled, &e.MaxAttempts, &e.CreatedAt, &e.UpdatedAt,
+		&e.ID, &e.URL, &e.Description, &types, &e.Enabled, &e.MaxAttempts, &e.RateLimit, &e.Ordered, &e.CreatedAt, &e.UpdatedAt,
 	}, extra...)
 	if err := row.Scan(dest...); err != nil {
 		return event.Endpoint{}, err

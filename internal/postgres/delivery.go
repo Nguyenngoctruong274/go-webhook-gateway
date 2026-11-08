@@ -67,25 +67,34 @@ func (s *Store) Claim(ctx context.Context, limit int, lease time.Duration) ([]Cl
 
 // claimTx is Claim inside its transaction.
 //
-// The breaker of each endpoint gates the claim: closed endpoints are
-// claimed freely; open ones are skipped until their period elapses;
-// after that, and when a half-open probe has timed out, exactly one
-// delivery is let through as the probe, chosen here by a SELECT on the
-// endpoint rows under FOR UPDATE SKIP LOCKED so that two instances
-// claiming at once cannot both probe. Deliveries locked but not admitted
-// are left untouched; they are not updated, so the lock is released at
-// commit and they stay pending.
+// The endpoint row gates the claim three ways, all from state every
+// instance shares: the circuit breaker (closed endpoints flow; open ones
+// are skipped until their period elapses, then exactly one probe goes
+// through), the rate limit (a cursor that each admitted delivery moves
+// forward by 1/rate) and ordering (one delivery at a time, the oldest
+// first). An endpoint that needs none of these is claimed freely; one
+// that does is locked with FOR UPDATE SKIP LOCKED so that two instances
+// claiming at once cannot both probe, both spend the same rate credit or
+// both take the head of an ordered queue. Deliveries locked but not
+// admitted are left untouched: they are not updated, so the lock is
+// released at commit and they stay pending.
 func (s *Store) claimTx(ctx context.Context, tx *sql.Tx, limit int, micros int64) ([]Claimed, error) {
-	// Candidate deliveries: due, pending, and not behind a breaker that
-	// is plainly shut. The breaker columns come along so that probes can
-	// be decided without a second read.
+	// Candidate deliveries: due, pending, and not behind a gate that is
+	// plainly shut (a breaker in its open period, a rate cursor in the
+	// future, an older open delivery to an ordered endpoint). The gate
+	// columns come along so that most endpoints need no second read.
 	rows, err := tx.QueryContext(ctx, `
-		SELECT d.id, d.endpoint_id, p.breaker_status, p.breaker_opened_until, p.breaker_probe_until, now()
+		SELECT d.id, d.endpoint_id, p.breaker_status, p.rate_limit, p.ordered, now()
 		FROM deliveries AS d JOIN endpoints AS p ON p.id = d.endpoint_id
 		WHERE d.state = 'pending' AND d.next_attempt_at <= now()
 		  AND (p.breaker_status = 'closed'
 		       OR (p.breaker_status = 'open' AND p.breaker_opened_until <= now())
 		       OR (p.breaker_status = 'half_open' AND p.breaker_probe_until <= now()))
+		  AND (p.rate_limit = 0 OR p.rate_cursor < now())
+		  AND (NOT p.ordered OR NOT EXISTS (
+		       SELECT 1 FROM deliveries AS older
+		       WHERE older.endpoint_id = d.endpoint_id
+		         AND (older.state = 'in_flight' OR (older.state = 'pending' AND older.id < d.id))))
 		ORDER BY d.next_attempt_at, d.id
 		LIMIT $1
 		FOR UPDATE OF d SKIP LOCKED`, limit)
@@ -94,7 +103,7 @@ func (s *Store) claimTx(ctx context.Context, tx *sql.Tx, limit int, micros int64
 	}
 	type candidate struct {
 		id, endpointID int64
-		st             breaker.State
+		gated          bool
 	}
 	var (
 		cands []candidate
@@ -102,20 +111,16 @@ func (s *Store) claimTx(ctx context.Context, tx *sql.Tx, limit int, micros int64
 	)
 	for rows.Next() {
 		var (
-			c      candidate
-			status string
-			opened sql.NullTime
-			probe  sql.NullTime
+			c       candidate
+			status  string
+			rate    int
+			ordered bool
 		)
-		if err := rows.Scan(&c.id, &c.endpointID, &status, &opened, &probe, &now); err != nil {
+		if err := rows.Scan(&c.id, &c.endpointID, &status, &rate, &ordered, &now); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("claim: %w", err)
 		}
-		c.st = breaker.State{OpenedUntil: opened.Time, ProbeUntil: probe.Time}
-		if c.st.Status, err = breaker.ParseStatus(status); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("claim: endpoint %d: %w", c.endpointID, err)
-		}
+		c.gated = status != string(breaker.Closed) || rate > 0 || ordered
 		cands = append(cands, c)
 	}
 	rows.Close()
@@ -123,36 +128,33 @@ func (s *Store) claimTx(ctx context.Context, tx *sql.Tx, limit int, micros int64
 		return nil, fmt.Errorf("claim: %w", err)
 	}
 
-	// Admit: closed endpoints pass; others get at most one probe each,
-	// and only if this transaction can lock the endpoint row.
+	// Admit. Ungated endpoints pass; the rest are decided by their gate,
+	// loaded once per endpoint under the row lock and written back once.
 	ids := make([]int64, 0, len(cands))
-	probed := map[int64]bool{}
+	gates := map[int64]*gate{}
 	for _, c := range cands {
-		if c.st.Status == breaker.Closed {
+		if !c.gated {
 			ids = append(ids, c.id)
 			continue
 		}
-		if probed[c.endpointID] {
-			continue
-		}
-		st, err := lockBreakerSkipLocked(ctx, tx, c.endpointID)
-		if err != nil {
-			return nil, fmt.Errorf("claim: %w", err)
-		}
-		if st == nil {
-			continue // another instance is deciding this endpoint's probe
-		}
-		switch st.Admit(now, s.breaker) {
-		case breaker.Send:
-			ids = append(ids, c.id) // closed meanwhile by a late success
-		case breaker.Probe:
-			if err := writeBreaker(ctx, tx, c.endpointID, *st); err != nil {
+		g, ok := gates[c.endpointID]
+		if !ok {
+			g, err = lockGate(ctx, tx, c.endpointID)
+			if err != nil {
 				return nil, fmt.Errorf("claim: %w", err)
 			}
+			gates[c.endpointID] = g // nil when another instance holds the row
+		}
+		if g != nil && g.admit(now, s.breaker) {
 			ids = append(ids, c.id)
-			probed[c.endpointID] = true
-		case breaker.Skip:
-			probed[c.endpointID] = true // someone else's probe is in flight
+		}
+	}
+	for id, g := range gates {
+		if g == nil || !g.changed {
+			continue
+		}
+		if err := writeGate(ctx, tx, id, g); err != nil {
+			return nil, fmt.Errorf("claim: %w", err)
 		}
 	}
 	if len(ids) == 0 {
@@ -197,18 +199,79 @@ func (s *Store) claimTx(ctx context.Context, tx *sql.Tx, limit int, micros int64
 	return claimed, nil
 }
 
-// lockBreakerSkipLocked loads an endpoint's breaker under FOR UPDATE SKIP
-// LOCKED; nil means another transaction holds the row.
-func lockBreakerSkipLocked(ctx context.Context, tx *sql.Tx, endpointID int64) (*breaker.State, error) {
-	st, err := scanBreaker(tx.QueryRowContext(ctx,
-		`SELECT `+breakerColumns+` FROM endpoints WHERE id = $1 FOR UPDATE SKIP LOCKED`, endpointID))
+// gate is the admission state of one endpoint during a claim: its
+// breaker, its rate cursor and whether it is ordered.
+type gate struct {
+	breaker breaker.State
+	rate    int
+	cursor  time.Time
+	ordered bool
+	// admitted counts deliveries let through in this claim; an ordered
+	// endpoint allows one, and a breaker that is not closed allows one
+	// probe.
+	admitted int
+	changed  bool
+}
+
+// RateBurst is how much credit an idle rate-limited endpoint keeps: the
+// cursor never starts further back than this, so after a quiet spell at
+// most one second's worth of deliveries goes out at once.
+const RateBurst = time.Second
+
+// admit decides one delivery and moves the gate when it says yes.
+func (g *gate) admit(now time.Time, p breaker.Policy) bool {
+	if g.ordered && g.admitted > 0 {
+		return false
+	}
+	cursor := g.cursor
+	if g.rate > 0 {
+		if floor := now.Add(-RateBurst); cursor.Before(floor) {
+			cursor = floor
+		}
+		if !cursor.Before(now) {
+			return false // the credit is spent until the cursor
+		}
+		cursor = cursor.Add(time.Second / time.Duration(g.rate))
+	}
+	st := g.breaker
+	if st.Admit(now, p) == breaker.Skip {
+		return false // open, or a probe (perhaps this claim's) is in flight
+	}
+	if st != g.breaker || !cursor.Equal(g.cursor) {
+		g.changed = true
+	}
+	g.breaker, g.cursor = st, cursor
+	g.admitted++
+	return true
+}
+
+// lockGate loads an endpoint's gate under FOR UPDATE SKIP LOCKED; nil
+// means another transaction holds the row and is deciding for it.
+func lockGate(ctx context.Context, tx *sql.Tx, endpointID int64) (*gate, error) {
+	g := &gate{}
+	var err error
+	g.breaker, err = scanBreaker(tx.QueryRowContext(ctx,
+		`SELECT `+breakerColumns+`, rate_limit, rate_cursor, ordered FROM endpoints WHERE id = $1 FOR UPDATE SKIP LOCKED`,
+		endpointID), &g.rate, &g.cursor, &g.ordered)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("lock breaker of endpoint %d: %w", endpointID, err)
+		return nil, fmt.Errorf("lock endpoint %d: %w", endpointID, err)
 	}
-	return &st, nil
+	return g, nil
+}
+
+func writeGate(ctx context.Context, tx *sql.Tx, endpointID int64, g *gate) error {
+	st := g.breaker
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE endpoints SET breaker_status = $2, breaker_failures = $3, breaker_opens = $4,
+			breaker_opened_until = $5, breaker_probe_until = $6, rate_cursor = $7
+		WHERE id = $1`,
+		endpointID, string(st.Status), st.Failures, st.Opens, nullTime(st.OpenedUntil), nullTime(st.ProbeUntil), g.cursor); err != nil {
+		return fmt.Errorf("write gate of endpoint %d: %w", endpointID, err)
+	}
+	return nil
 }
 
 // Finish records the result of the attempt a deliverer holds, as

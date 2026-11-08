@@ -25,10 +25,10 @@ func (s *Store) CreateEndpoint(ctx context.Context, spec event.EndpointSpec) (ep
 		return event.Endpoint{}, "", fmt.Errorf("create endpoint: %w", err)
 	}
 	ep, err = scanEndpoint(s.db.QueryRowContext(ctx, `
-		INSERT INTO endpoints (url, description, types, max_attempts, secret)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO endpoints (url, description, types, max_attempts, secret, rate_limit, ordered)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		RETURNING `+endpointColumns,
-		spec.URL, spec.Description, textArray(spec.Types), spec.MaxAttempts, secret))
+		spec.URL, spec.Description, textArray(spec.Types), spec.MaxAttempts, secret, spec.RateLimit, spec.Ordered))
 	if err != nil {
 		return event.Endpoint{}, "", fmt.Errorf("create endpoint: %w", err)
 	}
@@ -78,10 +78,10 @@ func (s *Store) UpdateEndpoint(ctx context.Context, id int64, spec event.Endpoin
 	}
 	ep, err := scanEndpoint(s.db.QueryRowContext(ctx, `
 		UPDATE endpoints
-		SET url = $2, description = $3, types = $4, max_attempts = $5, updated_at = now()
+		SET url = $2, description = $3, types = $4, max_attempts = $5, rate_limit = $6, ordered = $7, updated_at = now()
 		WHERE id = $1
 		RETURNING `+endpointColumns,
-		id, spec.URL, spec.Description, textArray(spec.Types), spec.MaxAttempts))
+		id, spec.URL, spec.Description, textArray(spec.Types), spec.MaxAttempts, spec.RateLimit, spec.Ordered))
 	if errors.Is(err, sql.ErrNoRows) {
 		return event.Endpoint{}, fmt.Errorf("update endpoint %d: %w", id, event.ErrNotFound)
 	}
