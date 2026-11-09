@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/signing"
@@ -22,7 +23,9 @@ const maxBody = 1 << 20
 // delivery it has already processed, because the gateway retries and a
 // retry may arrive after a success whose response was lost.
 type Receiver struct {
-	verifier signing.Verifier
+	// verifier is replaced whole by SetSecrets, so a request verifies
+	// against one consistent set while a rotation is being loaded.
+	verifier atomic.Pointer[signing.Verifier]
 	logger   *slog.Logger
 	// Handle processes an authentic, first-time delivery. An error makes
 	// the receiver answer 500 so that the gateway retries.
@@ -34,19 +37,29 @@ type Receiver struct {
 
 // New returns a receiver that accepts signatures under secrets.
 func New(secrets []string, logger *slog.Logger) *Receiver {
-	return &Receiver{
-		verifier: signing.Verifier{Secrets: secrets},
-		logger:   logger,
-		seen:     make(map[int64]time.Time),
-		Handle:   func(int64, []byte) error { return nil },
+	r := &Receiver{
+		logger: logger,
+		seen:   make(map[int64]time.Time),
+		Handle: func(int64, []byte) error { return nil },
 	}
+	r.SetSecrets(secrets)
+	return r
+}
+
+// SetSecrets replaces the secrets signatures are checked against: the
+// way a rotation reaches a running receiver. An empty list puts the
+// receiver in a not-configured state where it answers 503, so the
+// gateway retries rather than recording a 401 as a final rejection.
+func (r *Receiver) SetSecrets(secrets []string) {
+	r.verifier.Store(&signing.Verifier{Secrets: append([]string(nil), secrets...)})
 }
 
 // ServeHTTP verifies and dispatches one delivery.
 //
-// Replies: 401 for anything that fails verification (one code for every
-// cause, so a probe learns nothing), 200 for a duplicate (already done,
-// nothing to retry), 500 when Handle fails (please retry), 200 on success.
+// Replies: 503 while no secret is configured (please retry), 401 for
+// anything that fails verification (one code for every cause, so a
+// probe learns nothing), 200 for a duplicate (already done, nothing to
+// retry), 500 when Handle fails (please retry), 200 on success.
 func (r *Receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -58,7 +71,13 @@ func (r *Receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	ts, id, err := r.verifier.Verify(req.Header.Get, body)
+	v := r.verifier.Load()
+	if len(v.Secrets) == 0 {
+		r.logger.Warn("webhook arrived before any secret was configured; asking for a retry")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	ts, id, err := v.Verify(req.Header.Get, body)
 	if err != nil {
 		r.logger.Warn("rejected webhook", slog.Any("reason", err), slog.String("remote", req.RemoteAddr))
 		w.WriteHeader(http.StatusUnauthorized)
