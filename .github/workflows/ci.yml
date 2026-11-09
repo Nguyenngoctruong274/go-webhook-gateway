@@ -43,6 +43,11 @@ jobs:
         run: |
           go test -run '^$' -fuzz FuzzDeliveryInvariants -fuzztime 20s ./internal/event
           go test -run '^$' -fuzz FuzzVerify -fuzztime 15s ./internal/signing
+          go test -run '^$' -fuzz FuzzBreakerInvariants -fuzztime 15s ./internal/breaker
+      - name: Benchmarks (smoke)
+        # Keeps the benchmarks compiling and running; the numbers in the
+        # README come from longer runs, not from shared CI runners.
+        run: go test -run '^$' -bench . -benchtime 50x ./...
 
   lint:
     runs-on: ubuntu-latest

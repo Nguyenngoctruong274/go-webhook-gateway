@@ -50,6 +50,7 @@ flowchart LR
     D1 -. failures .-> B[breaker state<br/>per endpoint, in DB]
     DB -. attempts exhausted .-> DLQ[dead deliveries<br/>inspect, replay]
     O[Operators / customers] -->|GET /v1/deliveries, replay| API
+    P[Prometheus] -->|GET /metrics| API
 ```
 
 Everything in the diagram is built except the metrics and the
@@ -70,6 +71,7 @@ hardening of the last two days; the [roadmap](#roadmap) has the detail.
 | `internal/e2e` | End-to-end tests: API → store → deliverer → reference receiver, in one process against PostgreSQL |
 | `internal/breaker` | Per-endpoint circuit breaker: closed / open / half-open as a pure value; the store keeps one per endpoint so every instance sees the same breaker |
 | `internal/egress` | SSRF guard: resolves a receiver's host, refuses private, loopback, link-local and other reserved addresses, and connects to the address it checked |
+| `internal/metrics` | Dependency-free Prometheus text exposition: counters, gauges, histograms, scrape-time gauges (shared with the earlier projects of the series) |
 | `internal/testdb` | Isolated PostgreSQL schema per test |
 
 ## Quick start
@@ -528,12 +530,14 @@ instance enforces the same cap and the same order:
   holding the line. The scan excludes a delivery with an older pending
   or in-flight sibling (`deliveries_open_by_endpoint` answers that
   without reading the history), and the gate admits one per claim.
-  Ordering costs throughput: the next delivery is claimed on the next
-  claim cycle after the previous one finishes, so one instance moves an
-  ordered endpoint at about one delivery per `PollInterval` (1 s). It is
+  Ordering costs throughput, since one delivery is in flight at a time:
+  the endpoint goes as fast as the receiver answers. When an ordered
+  delivery finishes, the deliverer that finished it claims again at once
+  instead of sleeping out its poll interval (before that, an ordered
+  endpoint moved at one delivery per second: 20 events now take about a
+  second end to end against a local receiver, where they took 20). It is
   off by default and meant for endpoints whose events are state
-  transitions (`order.paid` before `order.shipped`); a wake-up on finish
-  is on the list for the metrics day.
+  transitions (`order.paid` before `order.shipped`).
 
 Checked against the real binaries: 30 events to an endpoint limited to
 5/s were delivered 5 in the first second and 5 in each second after;
@@ -546,6 +550,90 @@ so a row another instance is deciding is left to it), the breaker,
 cursor and order are applied in memory and written back once. Nothing
 is claimed by two instances, no credit is spent twice, and no two probes
 or two heads of an ordered queue go out together.
+
+## Observability
+
+`GET /metrics` serves Prometheus text, next to the probes and like them
+without the API token (keep it on the scraper's network). The families:
+
+| Metric | Type | Labels | Answers |
+|---|---|---|---|
+| `webhook_attempts_total` | counter | `endpoint`, `outcome` | Success rate per endpoint: `delivered` over all outcomes |
+| `webhook_attempt_duration_seconds` | histogram | `endpoint` | Receiver latency per endpoint, request to end of response |
+| `webhook_deliveries_ended_total` | counter | `endpoint`, `state` | Deliveries that reached `delivered`, `failed` (the dead-letter queue), `rejected` or `blocked` |
+| `webhook_backlog` | gauge | `kind` | Open deliveries: `due` (should be claimed now), `held` (due, behind an open breaker), `scheduled` (in backoff), `in_flight` |
+| `webhook_oldest_due_seconds` | gauge | | How long the oldest due delivery to a healthy endpoint has waited: is the gateway keeping up? |
+| `webhook_breakers`, `webhook_endpoint_breaker` | gauge | `status` (+ `endpoint`) | Breakers by status, and each endpoint's status |
+| `webhook_endpoints` | gauge | `enabled` | Endpoints enabled and paused |
+| `webhook_claims_total` | counter | `result` | Claims that took deliveries, found none, or failed |
+| `webhook_claim_wakeups_total` | counter | | Claims made at once after an ordered delivery finished |
+| `webhook_in_flight_requests` | gauge | | Requests running on this instance |
+| `webhook_lease_lost_total`, `webhook_report_errors_total` | counter | | Outcomes another deliverer pre-empted, or that could not be written |
+| `webhook_reaped_leases_total`, `webhook_reaper_sweeps_total` | counter | (`result`) | Deliverers that went silent mid-request |
+| `webhook_metrics_read_errors_total` | counter | | Failed snapshot reads: the backlog and breaker gauges are stale |
+| `http_requests_total`, `http_request_duration_seconds` | counter, histogram | `method`, `route`, `status` | The API, by route pattern (ids never become labels) |
+| `db_pool_*`, `go_*`, `process_uptime_seconds` | | | Connection pool saturation, goroutines, heap, restarts |
+
+Counters and histograms are per instance and sum across instances; the
+backlog and breaker gauges come from the shared database, so every
+instance reports the same values and dashboards should take `max`, not
+`sum`. They are read in one snapshot per scrape (cached for a second),
+from the open deliveries only, through the partial index on them, so the
+cost does not grow with history.
+
+**Cardinality.** Per-endpoint series grow with the number of endpoints,
+not with traffic, which is what makes per-endpoint success rates and
+latencies possible. Into the tens of thousands of endpoints the
+deliverer would aggregate before export instead.
+
+**Alerts** live in `deploy/alerts.yml`, split by who should act:
+
+- *The gateway's operators*: `WebhookBacklogGrowing` (oldest due
+  delivery to a healthy endpoint over 2 minutes; deliveries held by an
+  open breaker are excluded, so a customer's outage does not page
+  anyone), `WebhookClaimErrors`, `WebhookDeliverersCrashing` (reaped
+  leases), `WebhookReportErrors`, `WebhookMetricsStale`,
+  `WebhookDBPoolSaturated`, `WebhookAPIErrors` (5xx over 1%).
+- *Customers' receivers* (`audience: customer`, for a notification
+  rather than a pager): `WebhookEndpointFailing` (success under 50% over
+  15 minutes with at least one attempt a minute),
+  `WebhookEndpointBreakerOpen` (30 minutes), `WebhookEndpointSlow` (p95
+  over 5 s), `WebhookDeadLetters`.
+
+`TestAlertsUseExportedMetrics` starts the gateway, scrapes it and fails
+if an alert names a metric webhookd does not export, so a rename or a
+typo cannot leave an alert that silently never fires.
+`deploy/prometheus.yml` is the scrape config for the day-10 stack.
+
+## Benchmarks
+
+On a 2 vCPU container with PostgreSQL 16 on the same machine
+(`go test -run '^$' -bench . -benchtime 3s ./internal/...`):
+
+| Benchmark | Result | What it measures |
+|---|---|---|
+| `BenchmarkPublish/endpoints=1` | 1.09 ms/event, ~900 deliveries/s | Accept one event and fan it out, one transaction |
+| `BenchmarkPublish/endpoints=10` | 1.39 ms/event, ~7,200 deliveries/s | The same with ten subscribed endpoints |
+| `BenchmarkClaimFinish` | ~1,500 deliveries/s | Four deliverers claiming batches of 16 and recording each success: the database's ceiling, no HTTP |
+| `BenchmarkSend` | 28 µs, 118 allocs | One signed attempt to a loopback receiver, connection reused |
+| `BenchmarkCheck` (egress) | 141 ns, 0 allocs | The SSRF guard per new connection |
+
+Every Finish is its own transaction with a commit, and the commit is
+what costs: with `synchronous_commit = off` on the benchmark database
+the same runs reach ~1,700 events/s for a single-endpoint publish,
+~13,000 deliveries/s fanned out to ten, and ~2,100 deliveries/s for
+claim plus finish. That is a durability trade a deployment can make
+deliberately (a crash may lose the last few hundred milliseconds of
+recorded outcomes, which then retry and are deduplicated by receivers);
+the gateway does not make it for you.
+
+One optimisation was measured and left out: skipping the lock on the
+endpoint row in Finish when the breaker is closed with no failures
+counted. It gained nothing with durable commits and about 6% without
+them, not enough to justify a second code path in the breaker's
+bookkeeping. In practice the receivers' latency, not the database, sets
+the pace: at 100 ms per receiver, 16 requests in flight per instance
+make 160 deliveries/s, a tenth of what the store can record.
 
 ## API
 
@@ -601,7 +689,7 @@ A second test registers a private address and sees the delivery end as
 - [x] **Day 6**: Per-endpoint circuit breaker with state in PostgreSQL shared by all instances; half-open probes
 - [x] **Day 7**: SSRF protection (private, loopback and link-local ranges, pinned DNS); per-endpoint rate limit; optional in-order delivery per endpoint
 - [x] **Day 8**: Customer API: delivery history with response snippets, replay, pause and resume endpoints; end-to-end tests against the reference receiver
-- [ ] **Day 9**: Metrics (success rate and latency per endpoint, backlog, breaker states), alerts, benchmarks
+- [x] **Day 9**: Metrics (success rate and latency per endpoint, backlog, breaker states), alerts, benchmarks
 - [ ] **Day 10**: Final README, design decisions, Docker stack (webhookd, receiver, Prometheus), v1.0.0
 
 ## Notes
