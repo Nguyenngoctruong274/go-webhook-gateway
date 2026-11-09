@@ -5,9 +5,12 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/metrics"
 )
 
 // scriptedStore returns one prepared answer per Reap call and records
@@ -103,5 +106,29 @@ func TestSweepReportsPartialProgress(t *testing.T) {
 	n, err := New(store, quiet, Options{}).Sweep(context.Background())
 	if n != 2 || err == nil {
 		t.Fatalf("Sweep = %d, %v", n, err)
+	}
+}
+
+func TestSweepCountsReapedLeases(t *testing.T) {
+	reg := metrics.NewRegistry()
+	store := &scriptedStore{answers: []answer{
+		{ids: []int64{1, 2, 3}},
+		{ids: []int64{4}, err: errors.New("connection dropped")},
+		{},
+	}}
+	r := New(store, quiet, Options{Metrics: reg})
+	for range 3 {
+		_, _ = r.Sweep(context.Background())
+	}
+	var out strings.Builder
+	reg.Write(&out)
+	for _, want := range []string{
+		"webhook_reaped_leases_total 4\n",
+		`webhook_reaper_sweeps_total{result="error"} 1` + "\n",
+		`webhook_reaper_sweeps_total{result="ok"} 2` + "\n",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("metrics lack %q:\n%s", want, out.String())
+		}
 	}
 }

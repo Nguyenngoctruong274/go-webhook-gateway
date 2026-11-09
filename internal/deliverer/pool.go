@@ -50,6 +50,8 @@ type Options struct {
 	// DrainTimeout is how long shutdown waits for in-flight requests
 	// before cancelling them. Default 15s.
 	DrainTimeout time.Duration
+	// Metrics, when set, records claims, attempts and their latency.
+	Metrics *Metrics
 }
 
 // Pool claims due deliveries and sends them.
@@ -58,6 +60,12 @@ type Pool struct {
 	send   Transport
 	logger *slog.Logger
 	opts   Options
+	// wake makes the claim loop claim again at once instead of sleeping
+	// out its poll interval. A finished delivery to an ordered endpoint
+	// sends on it: the next delivery to that endpoint has just become
+	// claimable, and waiting a poll interval per delivery would cap an
+	// ordered endpoint at one delivery per interval.
+	wake chan struct{}
 }
 
 // New returns a Pool.
@@ -99,7 +107,7 @@ func New(store Store, send Transport, logger *slog.Logger, opts Options) (*Pool,
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Pool{store: store, send: send, logger: logger, opts: opts}, nil
+	return &Pool{store: store, send: send, logger: logger, opts: opts, wake: make(chan struct{}, 1)}, nil
 }
 
 // Run claims and sends until ctx ends, then drains: it claims nothing
@@ -166,6 +174,7 @@ func (p *Pool) claimLoop(ctx, sendCtx context.Context, slots chan struct{}, inFl
 		claimCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
 		claimed, err := p.store.Claim(claimCtx, free, p.opts.Lease)
 		cancel()
+		p.opts.Metrics.claimed(len(claimed), err)
 		for range free - len(claimed) {
 			<-slots
 		}
@@ -184,6 +193,8 @@ func (p *Pool) claimLoop(ctx, sendCtx context.Context, slots chan struct{}, inFl
 			select {
 			case <-ctx.Done():
 				return
+			case <-p.wake:
+				p.opts.Metrics.wokeUp()
 			case <-time.After(p.opts.PollInterval):
 			}
 		}
@@ -207,10 +218,13 @@ func (p *Pool) process(sendCtx context.Context, c postgres.Claimed) {
 	}()
 
 	start := time.Now()
+	p.opts.Metrics.started()
 	res := p.send.Send(ctx, Request{
 		DeliveryID: d.ID, EventType: c.Type, Body: c.Payload, URL: c.URL,
 		Secrets: c.Secrets.Active(time.Now()),
 	})
+	took := time.Since(start)
+	p.opts.Metrics.sent(d.EndpointID, res, took)
 	cancel()
 	<-beating
 
@@ -219,16 +233,26 @@ func (p *Pool) process(sendCtx context.Context, c postgres.Claimed) {
 	after, err := p.store.Finish(reportCtx, d.ID, d.Attempt, res)
 	switch {
 	case errors.Is(err, event.ErrLeaseLost):
+		p.opts.Metrics.leaseLost()
 		log.Warn("lease lost before the outcome was reported; another deliverer owns it", slog.Any("result", res.Outcome))
 		return
 	case err != nil:
 		// The delivery stays in flight; the reaper retries it once the
 		// lease runs out.
+		p.opts.Metrics.reportFailed()
 		log.Error("reporting the outcome failed", slog.Any("error", err))
 		return
 	}
+	after.EndpointID = d.EndpointID // fakes may leave it out; the store always sets it
+	p.opts.Metrics.finished(after)
+	if c.Ordered {
+		select {
+		case p.wake <- struct{}{}:
+		default: // a wake-up is already pending
+		}
+	}
 	attrs := []any{slog.String("outcome", res.Outcome.String()), slog.Int("status", res.Status),
-		slog.String("state", string(after.State)), slog.Duration("took", time.Since(start))}
+		slog.String("state", string(after.State)), slog.Duration("took", took)}
 	switch after.State {
 	case event.StateDelivered:
 		log.Info("delivered", attrs...)

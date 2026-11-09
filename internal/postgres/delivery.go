@@ -29,6 +29,10 @@ type Claimed struct {
 	Payload  []byte
 	URL      string
 	Secrets  signing.Rotation
+	// Ordered says the endpoint takes one delivery at a time: the next
+	// one becomes claimable when this one finishes, so the deliverer
+	// should claim again then rather than wait for its poll interval.
+	Ordered bool
 }
 
 // Claim starts the next attempt of up to limit due pending deliveries, in
@@ -172,7 +176,7 @@ func (s *Store) claimTx(ctx context.Context, tx *sql.Tx, limit int, micros int64
 		WHERE d.id = ANY($1) AND e.id = d.event_id AND p.id = d.endpoint_id
 		RETURNING d.id, d.event_id, d.endpoint_id, d.state, d.attempt, d.max_attempts,
 			d.next_attempt_at, d.lease_until, d.last_status, d.last_error, d.delivered_at, d.created_at,
-			e.type, e.payload, p.url, p.secret, p.previous_secret, p.previous_secret_until`,
+			e.type, e.payload, p.url, p.secret, p.previous_secret, p.previous_secret_until, p.ordered`,
 		pq.Array(ids), micros)
 	if err != nil {
 		return nil, fmt.Errorf("claim: %w", err)
@@ -186,7 +190,7 @@ func (s *Store) claimTx(ctx context.Context, tx *sql.Tx, limit int, micros int64
 			until sql.NullTime
 		)
 		c.Delivery, err = scanDelivery(rows, &c.Type, &c.Payload, &c.URL,
-			&c.Secrets.Current, &c.Secrets.Previous, &until)
+			&c.Secrets.Current, &c.Secrets.Previous, &until, &c.Ordered)
 		if err != nil {
 			return nil, fmt.Errorf("claim: %w", err)
 		}

@@ -10,6 +10,8 @@ import (
 	"errors"
 	"log/slog"
 	"time"
+
+	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/metrics"
 )
 
 // Store is what the reaper needs from the job store.
@@ -26,6 +28,8 @@ type Options struct {
 	Interval time.Duration
 	// BatchSize is the most leases one sweep expires. Default 100.
 	BatchSize int
+	// Metrics, when set, receives the reaper's counters.
+	Metrics *metrics.Registry
 }
 
 // Reaper sweeps expired leases on a timer.
@@ -33,6 +37,9 @@ type Reaper struct {
 	store  Store
 	logger *slog.Logger
 	opts   Options
+	// reaped counts leases expired; sweeps counts sweeps by result.
+	reaped *metrics.CounterVec
+	sweeps *metrics.CounterVec
 }
 
 // New returns a Reaper over store.
@@ -46,7 +53,15 @@ func New(store Store, logger *slog.Logger, opts Options) *Reaper {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Reaper{store: store, logger: logger, opts: opts}
+	reg := opts.Metrics
+	if reg == nil {
+		reg = metrics.NewRegistry() // count anyway; nothing serves it
+	}
+	return &Reaper{store: store, logger: logger, opts: opts,
+		reaped: reg.NewCounterVec("webhook_reaped_leases_total",
+			"Leases that ran out without a report: each is a deliverer that crashed, stalled or lost its network."),
+		sweeps: reg.NewCounterVec("webhook_reaper_sweeps_total", "Reaper sweeps by result: ok or error.", "result"),
+	}
 }
 
 // Run sweeps until ctx ends. Errors are logged and retried on the next
@@ -84,8 +99,11 @@ func (r *Reaper) Sweep(ctx context.Context) (int, error) {
 		r.logger.WarnContext(ctx, "expired leases of silent deliverers",
 			slog.Int("deliveries", len(ids)), slog.Any("ids", ids))
 	}
+	r.reaped.Add(float64(len(ids)))
 	if err != nil && !errors.Is(err, context.Canceled) {
+		r.sweeps.Inc("error")
 		return len(ids), err
 	}
+	r.sweeps.Inc("ok")
 	return len(ids), nil
 }

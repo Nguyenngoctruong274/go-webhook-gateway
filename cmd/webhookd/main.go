@@ -18,6 +18,7 @@ import (
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/deliverer"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/egress"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/httpapi"
+	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/metrics"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/postgres"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/reaper"
 )
@@ -69,13 +70,19 @@ func run() error {
 		return err
 	}
 
+	// One registry for the whole process, served at /metrics.
+	reg := metrics.NewRegistry()
+	metrics.RegisterRuntime(reg)
+	postgres.RegisterPoolMetrics(reg, db)
+	store.RegisterQueueMetrics(reg, logger, time.Second)
+
 	// The reaper runs until shutdown and is awaited before the database
 	// handle is closed (defers run in reverse order).
 	reapCtx, stopReaper := context.WithCancel(context.Background())
 	reaperDone := make(chan struct{})
 	go func() {
 		defer close(reaperDone)
-		_ = reaper.New(store, logger, reaper.Options{Interval: cfg.ReapInterval}).Run(reapCtx)
+		_ = reaper.New(store, logger, reaper.Options{Interval: cfg.ReapInterval, Metrics: reg}).Run(reapCtx)
 	}()
 	defer func() {
 		stopReaper()
@@ -91,6 +98,7 @@ func run() error {
 			Concurrency:  cfg.DeliverConcurrency,
 			Lease:        cfg.DeliverLease,
 			DrainTimeout: cfg.DeliverDrain,
+			Metrics:      deliverer.NewMetrics(reg),
 		})
 		if err != nil {
 			return err
@@ -119,7 +127,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(logger, httpapi.Options{Ready: ready, Store: store, Token: cfg.APIToken}),
+		Handler:           httpapi.NewHandler(logger, httpapi.Options{Ready: ready, Store: store, Token: cfg.APIToken, Metrics: reg}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

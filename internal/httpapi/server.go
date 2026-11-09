@@ -10,8 +10,11 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/metrics"
 )
 
 // RequestIDHeader carries the request id in and out of the service.
@@ -26,6 +29,10 @@ type Options struct {
 	Store Store
 	// Token, when set, is the bearer token every /v1 request must carry.
 	Token string
+	// Metrics, when set, receives the HTTP metrics and is served at
+	// GET /metrics, next to the probes and like them without the token:
+	// expose it to the scraper's network only.
+	Metrics *metrics.Registry
 }
 
 type api struct {
@@ -33,6 +40,9 @@ type api struct {
 	ready  func(context.Context) error
 	store  Store
 	token  string
+
+	requests *metrics.CounterVec
+	latency  *metrics.HistogramVec
 }
 
 // NewHandler returns the root handler of the service.
@@ -40,11 +50,24 @@ func NewHandler(logger *slog.Logger, opts Options) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	a := &api{logger: logger, ready: opts.Ready, store: opts.Store, token: opts.Token}
+	reg := opts.Metrics
+	if reg == nil {
+		reg = metrics.NewRegistry() // instrument anyway; nothing serves it
+	}
+	a := &api{
+		logger: logger, ready: opts.Ready, store: opts.Store, token: opts.Token,
+		requests: reg.NewCounterVec("http_requests_total",
+			"HTTP requests by method, route pattern and status code.", "method", "route", "status"),
+		latency: reg.NewHistogramVec("http_request_duration_seconds",
+			"HTTP request latency by method and route pattern.", metrics.DefaultLatencyBuckets, "method", "route"),
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("GET /readyz", a.readyz)
+	if opts.Metrics != nil {
+		mux.Handle("GET /metrics", opts.Metrics.Handler())
+	}
 	if a.store != nil {
 		a.routes(mux)
 	}
@@ -102,8 +125,10 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
-// instrument logs every request at debug level with its route pattern
-// rather than the raw path. Metrics arrive on day 9.
+// instrument counts and times every request by its route pattern rather
+// than the raw path, so ids in paths do not each become a series, and
+// logs it at debug level. Methods outside the usual set are counted as
+// "other" for the same reason.
 func (a *api) instrument(mux *http.ServeMux, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -119,6 +144,14 @@ func (a *api) instrument(mux *http.ServeMux, next http.Handler) http.Handler {
 				route = pattern
 			}
 		}
+		method := r.Method
+		switch method {
+		case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodHead, http.MethodPatch:
+		default:
+			method = "other"
+		}
+		a.requests.Inc(method, route, strconv.Itoa(rec.status))
+		a.latency.Observe(elapsed.Seconds(), method, route)
 		a.logger.DebugContext(r.Context(), "request",
 			slog.String("request_id", RequestID(r.Context())),
 			slog.String("method", r.Method), slog.String("route", route),
