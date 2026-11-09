@@ -12,7 +12,17 @@ stops hammering an endpoint that is down, refuses to call addresses it
 should not, and keeps the delivery history so customers can see what
 happened and replay it.
 
-> 🚧 Built in public as a 10-day series. See the [roadmap](#roadmap) for progress.
+**v1.0.0.** Built in public over ten days, one tested increment a day
+([roadmap](#roadmap)). About 5,500 lines of Go and as many of tests, with
+one dependency (`lib/pq`); every PostgreSQL behaviour is tested against a real
+PostgreSQL, and the Docker stack is smoke-tested in CI.
+
+**Contents:** [Why](#why) · [Architecture](#architecture) ·
+[Run it](#quick-start) · [Design decisions](#design-decisions) ·
+[Configuration](#configuration) · [Signing](#signing) ·
+[Delivering](#delivering) · [Circuit breaker](#circuit-breaker) ·
+[Egress guard](#egress-guard-ssrf) · [Observability](#observability) ·
+[Benchmarks](#benchmarks) · [API](#api)
 
 ## Why
 
@@ -53,13 +63,15 @@ flowchart LR
     P[Prometheus] -->|GET /metrics| API
 ```
 
-Everything in the diagram is built except the metrics and the
-hardening of the last two days; the [roadmap](#roadmap) has the detail.
+One process, `webhookd`, runs the API, a pool of deliverers and the
+reaper; run as many instances as the load needs. They share nothing but
+PostgreSQL: claims, leases, breakers, rate cursors and ordering all live
+in rows, so instances need no coordination of their own.
 
 | Package | Responsibility |
 |---|---|
 | `cmd/webhookd` | Service wiring, graceful shutdown |
-| `cmd/webhook-receiver` | Serves `internal/receiver`, the reference receiver: verifies signatures, ignores duplicate deliveries, asks for retries on failure |
+| `cmd/webhook-receiver` | Serves `internal/receiver`, the reference receiver: verifies signatures, ignores duplicate deliveries, asks for retries on failure; secrets from `RECEIVER_SECRETS` or a watched `RECEIVER_SECRETS_FILE` |
 | `internal/config` | Environment configuration with validation |
 | `internal/httpapi` | Probes and the customer API under `/v1`: endpoints, events, delivery history, replay and cancel; bearer token; JSON errors with codes |
 | `internal/event` | Domain: events, endpoints, deliveries; outcome classification; delivery state machine with fenced attempts; retry backoff with jitter (no I/O) |
@@ -75,6 +87,23 @@ hardening of the last two days; the [roadmap](#roadmap) has the detail.
 | `internal/testdb` | Isolated PostgreSQL schema per test |
 
 ## Quick start
+
+The whole system in Docker, with a receiver and Prometheus:
+
+```bash
+make stack-up    # postgres, webhookd :8080, receiver, setup, prometheus :9090
+make smoke       # publish an event; wait until the receiver has it and Prometheus counts it
+open http://localhost:9090/alerts
+make down
+```
+
+The `setup` service registers the receiver with webhookd and hands it
+the secret through a shared volume; the receiver watches that file, so
+`POST /v1/endpoints/1/secret` followed by a new file is a rotation
+without a restart. The API token of the stack is
+`stack-demo-token-change-me`.
+
+To work on the code:
 
 ```bash
 make up          # PostgreSQL in Docker (databases webhooks and webhooks_test)
@@ -106,7 +135,66 @@ For a receiver on the loopback, start webhookd with
 webhookd applies pending migrations at startup, under an advisory lock so
 that several instances starting together migrate once.
 
-Or run everything in containers: `make stack`.
+`make help` lists the rest: `test`, `test-db`, `bench`, `lint`, `cover`.
+
+## Design decisions
+
+The choices that shape the system, and what each one costs.
+
+1. **PostgreSQL is the queue.** Events, deliveries, leases and breaker
+   state live in the same database, so publishing an event and fanning it
+   out is one transaction, and there is no second system to run, back up
+   or keep consistent with the first. Deliverers claim with
+   `FOR UPDATE SKIP LOCKED`, so many of them never wait on each other.
+   *Cost:* throughput is bounded by commits (about 1,500 deliveries/s
+   recorded on 2 vCPU, see [Benchmarks](#benchmarks)), well above what
+   receivers' latency allows per instance, but a ceiling all the same. A
+   log-based broker would raise it and take the transactional fan-out
+   with it.
+2. **At least once, never exactly once.** The gateway cannot know whether
+   a request that timed out reached the receiver, so it retries, and every
+   attempt carries the same `Webhook-Id` for the receiver to deduplicate
+   on. The reference receiver shows how. Exactly-once would need the
+   receiver's cooperation in a protocol webhooks do not have.
+3. **The attempt number is a fencing token.** A claim increments it; every
+   heartbeat and report must present it. A deliverer that stalled past its
+   lease and wakes up later cannot overwrite the outcome of the attempt
+   that replaced it. The reaper ends silent attempts the same way.
+4. **The domain has no I/O.** The delivery state machine, the backoff, the
+   outcome classification and the circuit breaker are plain values with
+   methods, fuzzed for their invariants; the store loads a row, applies
+   the method and writes it back in one transaction, and CHECK
+   constraints restate the invariants so a query bug cannot store a state
+   the domain would never produce.
+5. **Shared state per endpoint, not per instance.** The breaker, the rate
+   cursor and the ordering rule are columns on the endpoint row, decided
+   inside the claim under a row lock. With N instances an endpoint gets
+   one breaker, one rate limit and one queue, not N of each.
+6. **Signatures over a timestamp and the exact bytes.** The payload is
+   stored as `json`, not `jsonb`, so the body a receiver verifies is byte
+   for byte what was published. Two secrets are valid during a rotation
+   and each request carries both signatures, so rotating never breaks a
+   receiver that has not switched yet.
+7. **SSRF is stopped at the socket.** URLs are checked when the gateway
+   connects, against the address it resolved and then dials, not when
+   they are registered, so DNS changes and rebinding cannot route a signed
+   request into the gateway's own network. Redirects are never followed.
+8. **Retries respect the receiver.** 4xx is a final answer (except 408 and
+   429), 5xx and timeouts back off exponentially with jitter, a failing
+   endpoint is cut off by its breaker and probed once at a time, and an
+   endpoint can cap its rate. A dead-lettered delivery waits for a human
+   and a replay.
+9. **Customers and operators get different alerts.** A receiver that is
+   down is the customer's problem and must not page the gateway's on-call:
+   deliveries held by an open breaker are left out of the backlog age, and
+   receiver-side alerts carry `audience: customer`.
+10. **One dependency.** `lib/pq` and the standard library; the Prometheus
+    exposition is written here. Fewer moving parts to audit, at the price
+    of writing a few hundred lines that a library would provide.
+
+What is deliberately left out: per-tenant API keys (one bearer token
+guards the API), payload transformation, fan-in from a message broker,
+and a UI. Each would sit on top of what is here without changing it.
 
 ## Configuration
 
@@ -258,7 +346,14 @@ database keyed by `Webhook-Id`.
 
 ```bash
 RECEIVER_SECRETS=whsec_...,whsec_old... RECEIVER_ADDR=:9000 go run ./cmd/webhook-receiver
+# or, from a mounted secret that is reloaded when it changes:
+RECEIVER_SECRETS_FILE=/run/secrets/webhook RECEIVER_ADDR=:9000 go run ./cmd/webhook-receiver
 ```
+
+With a secrets file, the receiver answers 503 until the file holds a
+secret (so the gateway retries instead of recording a final 401), picks
+up a rotation within two seconds, and keeps the secrets it has when the
+file is removed or holds something that is not a list of secrets.
 
 Tests sign and verify round trips, every rejection (tampered body, wrong
 secret, missing or malformed headers, stale and future timestamps, a
@@ -690,7 +785,7 @@ A second test registers a private address and sees the delivery end as
 - [x] **Day 7**: SSRF protection (private, loopback and link-local ranges, pinned DNS); per-endpoint rate limit; optional in-order delivery per endpoint
 - [x] **Day 8**: Customer API: delivery history with response snippets, replay, pause and resume endpoints; end-to-end tests against the reference receiver
 - [x] **Day 9**: Metrics (success rate and latency per endpoint, backlog, breaker states), alerts, benchmarks
-- [ ] **Day 10**: Final README, design decisions, Docker stack (webhookd, receiver, Prometheus), v1.0.0
+- [x] **Day 10**: Final README, design decisions, Docker stack (webhookd, receiver, Prometheus), v1.0.0
 
 ## Notes
 
@@ -698,6 +793,9 @@ A second test registers a private address and sees the delivery end as
   fetch `golang.org/x`, `google.golang.org` or `gopkg.in`, so pgx, gRPC,
   the Prometheus client and YAML are out; the metrics exposition is
   written in the repository, as in the earlier projects of this series.
+- The Docker stack is checked in CI on every push: `promtool` validates
+  the alert rules and the Prometheus config, then the stack is brought up
+  and `deploy/smoke.sh` runs against it.
 
 ## License
 

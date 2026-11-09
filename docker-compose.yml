@@ -1,6 +1,14 @@
 # `docker compose up -d` starts only PostgreSQL, for local development and
-# tests. `docker compose --profile stack up --build` also runs webhookd.
-# Credentials here are for local use only.
+# tests. `docker compose --profile stack up --build` runs the whole demo:
+#
+#   postgres    the queue and the endpoints
+#   webhookd    API on :8080, deliverers, reaper, /metrics
+#   receiver    the reference receiver, reading its secret from a volume
+#   setup       registers the receiver and hands it its secret, then exits
+#   prometheus  scrapes webhookd every 5s and evaluates deploy/alerts.yml (:9090)
+#
+# Then `./deploy/smoke.sh` publishes an event and checks it end to end.
+# Credentials and the API token here are for local use only.
 services:
   postgres:
     image: postgres:16-alpine
@@ -22,13 +30,14 @@ services:
   webhookd:
     profiles: ["stack"]
     build: .
+    image: go-webhook-gateway:local
     environment:
       WH_DATABASE_URL: postgres://webhooks:webhooks@postgres:5432/webhooks?sslmode=disable
       WH_LOG_LEVEL: info
       WH_SHUTDOWN_DRAIN: 2s
-      # A receiver run on the host or on the Docker network has a private
-      # address, which the egress guard refuses by default. Never set
-      # this in production.
+      WH_API_TOKEN: stack-demo-token-change-me
+      # The receiver has a private address on the Docker network, which
+      # the egress guard refuses by default. Never set this in production.
       WH_EGRESS_ALLOW: 172.16.0.0/12,10.0.0.0/8,192.168.0.0/16
     ports:
       - "8080:8080"
@@ -37,5 +46,48 @@ services:
       postgres:
         condition: service_healthy
 
+  receiver:
+    profiles: ["stack"]
+    build: . # the same image as webhookd; the second build is a cache hit
+    image: go-webhook-gateway:local
+    entrypoint: ["/webhook-receiver"]
+    environment:
+      RECEIVER_ADDR: ":9000"
+      RECEIVER_SECRETS_FILE: /secrets/receiver
+    volumes:
+      - secrets:/secrets:ro
+    depends_on:
+      - webhookd
+
+  setup:
+    profiles: ["stack"]
+    image: curlimages/curl:8.10.1
+    user: root # to write into the fresh volume
+    entrypoint: ["sh", "/setup.sh"]
+    environment:
+      API_TOKEN: stack-demo-token-change-me
+    volumes:
+      - ./deploy/setup.sh:/setup.sh:ro
+      - secrets:/secrets
+    depends_on:
+      - webhookd
+      - receiver
+    restart: "no"
+
+  prometheus:
+    profiles: ["stack"]
+    image: prom/prometheus:v2.53.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=1d
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - webhookd
+
 volumes:
   pgdata:
+  secrets:

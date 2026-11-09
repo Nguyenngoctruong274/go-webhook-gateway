@@ -74,15 +74,14 @@ jobs:
         run: docker compose --profile stack config -q
       - name: Build image
         run: docker build -t go-webhook-gateway:ci .
+      - name: Check Prometheus config and alert rules
+        run: |
+          docker run --rm --entrypoint promtool -v "$PWD/deploy:/deploy:ro" prom/prometheus:v2.53.0 check rules /deploy/alerts.yml
+          docker run --rm --entrypoint promtool -v "$PWD/deploy:/etc/prometheus:ro" prom/prometheus:v2.53.0 check config /etc/prometheus/prometheus.yml
       - name: Smoke test the stack
         run: |
           docker compose --profile stack up -d --build
-          for i in $(seq 1 30); do
-            curl -fsS localhost:8080/readyz && exit 0
-            sleep 2
-          done
-          docker compose --profile stack logs
-          exit 1
+          sh ./deploy/smoke.sh || { docker compose --profile stack logs; exit 1; }
       - name: Tear down
         if: always()
         run: docker compose --profile stack down -v

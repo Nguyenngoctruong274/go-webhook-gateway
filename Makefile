@@ -41,9 +41,21 @@ up: ## Start local dependencies (PostgreSQL)
 	docker compose up -d
 
 .PHONY: stack
-stack: ## Run webhookd and PostgreSQL in Docker
+stack: ## Run the demo stack in the foreground (webhookd, receiver, Prometheus, PostgreSQL)
 	docker compose --profile stack up --build
 
+.PHONY: stack-up
+stack-up: ## Start the demo stack in the background
+	docker compose --profile stack up -d --build
+
+.PHONY: smoke
+smoke: ## Publish an event through the running stack and check it end to end
+	sh ./deploy/smoke.sh
+
+.PHONY: bench
+bench: ## Run the benchmarks (needs `make up`)
+	WH_TEST_DATABASE_URL=$(TEST_DB) go test -run '^$$' -bench . -benchtime 3s ./internal/...
+
 .PHONY: down
-down: ## Stop everything
-	docker compose --profile stack down
+down: ## Stop everything and drop the volumes
+	docker compose --profile stack down -v
