@@ -7,6 +7,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
+	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,7 +27,9 @@ import (
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/egress"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/event"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/httpapi"
+	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/metrics"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/postgres"
+	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/reaper"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/receiver"
 	"github.com/Nguyenngoctruong274/go-webhook-gateway/internal/testdb"
 )
@@ -38,6 +44,18 @@ type gateway struct {
 	store *postgres.Store
 }
 
+// registerAll builds the registry webhookd serves: every family the
+// process exports, the same way cmd/webhookd wires them.
+func registerAll(t *testing.T, store *postgres.Store, db *sql.DB) (*metrics.Registry, *deliverer.Metrics) {
+	t.Helper()
+	reg := metrics.NewRegistry()
+	metrics.RegisterRuntime(reg)
+	postgres.RegisterPoolMetrics(reg, db)
+	store.RegisterQueueMetrics(reg, quiet, 0)
+	_ = reaper.New(store, quiet, reaper.Options{Metrics: reg})
+	return reg, deliverer.NewMetrics(reg)
+}
+
 func startGateway(t *testing.T) *gateway {
 	t.Helper()
 	db := testdb.New(t, postgres.Migrate)
@@ -45,12 +63,14 @@ func startGateway(t *testing.T) *gateway {
 	if err != nil {
 		t.Fatal(err)
 	}
-	api := httptest.NewServer(httpapi.NewHandler(quiet, httpapi.Options{Store: store, Token: apiToken}))
+	reg, poolMetrics := registerAll(t, store, db)
+	api := httptest.NewServer(httpapi.NewHandler(quiet, httpapi.Options{Store: store, Token: apiToken, Metrics: reg}))
 	t.Cleanup(api.Close)
 
 	loopback := egress.Policy{Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}}
 	pool, err := deliverer.New(store, deliverer.NewSender(2*time.Second, loopback), quiet, deliverer.Options{
 		Concurrency: 4, Lease: 5 * time.Second, PollInterval: 20 * time.Millisecond, DrainTimeout: time.Second,
+		Metrics: poolMetrics,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -287,5 +307,96 @@ func TestEndToEndBlockedDestination(t *testing.T) {
 	blocked := g.waitFor(t, d, func(d map[string]any) bool { return d["state"] == "blocked" })
 	if blocked["attempt"].(float64) != 1 || blocked["last_error"] == "" {
 		t.Fatalf("blocked = %v", blocked)
+	}
+}
+
+// scrape fetches /metrics the way Prometheus does: no token.
+func (g *gateway) scrape(t *testing.T) string {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, g.api.URL+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("/metrics: %d, %v", resp.StatusCode, err)
+	}
+	return string(body)
+}
+
+func TestMetricsTellTheStory(t *testing.T) {
+	g := startGateway(t)
+	created := g.must(t, "POST", "/v1/endpoints", map[string]any{"url": "http://placeholder.invalid/webhook"}, 201)
+	epID := id(created, "id")
+	cust := startCustomer(t, id(created, "secret"))
+	g.must(t, "PUT", "/v1/endpoints/"+epID, map[string]any{"url": cust.srv.URL + "/webhook", "max_attempts": 1}, 200)
+
+	pub := g.must(t, "POST", "/v1/events", map[string]any{"type": "a", "payload": map[string]any{}}, 201)
+	ev := g.must(t, "GET", "/v1/events/"+id(pub, "event", "id"), nil, 200)
+	g.waitFor(t, id(ev["deliveries"].([]any)[0].(map[string]any), "id"), func(d map[string]any) bool { return d["state"] == "delivered" })
+
+	cust.setFail(true) // one attempt allowed: this one ends in the dead-letter queue
+	pub = g.must(t, "POST", "/v1/events", map[string]any{"type": "a", "payload": map[string]any{}}, 201)
+	ev = g.must(t, "GET", "/v1/events/"+id(pub, "event", "id"), nil, 200)
+	g.waitFor(t, id(ev["deliveries"].([]any)[0].(map[string]any), "id"), func(d map[string]any) bool { return d["state"] == "failed" })
+
+	got := g.scrape(t)
+	for _, want := range []string{
+		`webhook_attempts_total{endpoint="` + epID + `",outcome="delivered"} 1`,
+		`webhook_attempts_total{endpoint="` + epID + `",outcome="retry"} 1`,
+		`webhook_deliveries_ended_total{endpoint="` + epID + `",state="delivered"} 1`,
+		`webhook_deliveries_ended_total{endpoint="` + epID + `",state="failed"} 1`,
+		`webhook_attempt_duration_seconds_count{endpoint="` + epID + `"} 2`,
+		`webhook_endpoint_breaker{endpoint="` + epID + `",status="closed"} 1`,
+		`webhook_backlog{kind="due"} 0`,
+		`http_requests_total{method="POST",route="/v1/events",status="201"} 2`,
+	} {
+		if !strings.Contains(got, want+"\n") {
+			t.Errorf("/metrics lacks %q", want)
+		}
+	}
+	if t.Failed() {
+		t.Log(got)
+	}
+}
+
+// metricName finds the series names in a PromQL expression.
+var metricName = regexp.MustCompile(`\b((?:webhook|db_pool|http|go|process)_[a-z0-9_]+)\b`)
+
+// TestAlertsUseExportedMetrics keeps deploy/alerts.yml honest: a renamed
+// metric or a typo in an alert would otherwise make the alert silently
+// never fire.
+func TestAlertsUseExportedMetrics(t *testing.T) {
+	g := startGateway(t)
+	exported := g.scrape(t)
+	raw, err := os.ReadFile("../../deploy/alerts.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") || strings.Contains(line, "runbook:") || strings.Contains(line, "summary:") {
+			continue
+		}
+		for _, m := range metricName.FindAllStringSubmatch(line, -1) {
+			name := m[1]
+			for _, suffix := range []string{"_bucket", "_count", "_sum"} {
+				if base, ok := strings.CutSuffix(name, suffix); ok && strings.Contains(exported, "# TYPE "+base+" histogram") {
+					name = base
+				}
+			}
+			seen[name] = true
+			if !strings.Contains(exported, "# TYPE "+name+" ") {
+				t.Errorf("alerts.yml uses %s, which webhookd does not export", m[1])
+			}
+		}
+	}
+	if len(seen) < 10 {
+		t.Fatalf("found only %d metric names in alerts.yml: %v", len(seen), seen)
 	}
 }

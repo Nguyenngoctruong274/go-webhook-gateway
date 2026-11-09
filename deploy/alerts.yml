@@ -1,0 +1,100 @@
+# Alerts for go-webhook-gateway. Every metric named here is checked
+# against what webhookd exports by internal/e2e (TestAlertsUseExportedMetrics).
+groups:
+  - name: webhook-gateway
+    rules:
+      # --- the gateway itself (page the gateway's operators) -------------
+
+      - alert: WebhookBacklogGrowing
+        # Due deliveries to healthy endpoints are waiting: deliverers are
+        # too few, stuck, or cannot reach PostgreSQL. Deliveries held back
+        # by an open breaker are excluded on purpose.
+        expr: max(webhook_oldest_due_seconds) > 120
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Due webhook deliveries have waited over 2 minutes"
+          runbook: "Check webhook_claims_total{result=\"error\"}, db_pool_wait_total and webhook_in_flight_requests; add deliverers or raise WH_DELIVER_CONCURRENCY."
+
+      - alert: WebhookClaimErrors
+        expr: sum(rate(webhook_claims_total{result="error"}[5m])) > 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Deliverers cannot claim from PostgreSQL"
+
+      - alert: WebhookDeliverersCrashing
+        # A reaped lease is a deliverer that went silent mid-request.
+        expr: sum(increase(webhook_reaped_leases_total[10m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Leases expired without a report: deliverers are crashing or stalling"
+
+      - alert: WebhookReportErrors
+        expr: sum(increase(webhook_report_errors_total[10m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Attempt outcomes could not be written; affected deliveries wait for the reaper"
+
+      - alert: WebhookMetricsStale
+        expr: sum(increase(webhook_metrics_read_errors_total[5m])) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The queue snapshot cannot be read; backlog and breaker gauges are stale"
+
+      - alert: WebhookDBPoolSaturated
+        expr: sum(rate(db_pool_wait_total[5m])) > 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Callers wait for database connections; raise WH_DB_MAX_CONNS or add capacity"
+
+      - alert: WebhookAPIErrors
+        expr: |
+          sum(rate(http_requests_total{route=~"/v1/.*",status=~"5.."}[5m]))
+            / sum(rate(http_requests_total{route=~"/v1/.*"}[5m])) > 0.01
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Over 1% of customer API requests fail with a 5xx"
+
+      # --- customers' receivers (tell the customer, not a pager) ----------
+
+      - alert: WebhookEndpointFailing
+        # Success rate under 50% over 15 minutes, with enough traffic for
+        # the ratio to mean something (at least one attempt a minute).
+        expr: |
+          (
+            sum by (endpoint) (rate(webhook_attempts_total{outcome!="delivered"}[15m]))
+              / sum by (endpoint) (rate(webhook_attempts_total[15m]))
+          ) > 0.5
+          and sum by (endpoint) (rate(webhook_attempts_total[15m])) > 1/60
+        for: 15m
+        labels: {severity: info, audience: customer}
+        annotations:
+          summary: "Endpoint {{ $labels.endpoint }} fails most deliveries"
+
+      - alert: WebhookEndpointBreakerOpen
+        expr: max by (endpoint) (webhook_endpoint_breaker{status!="closed"}) == 1
+        for: 30m
+        labels: {severity: info, audience: customer}
+        annotations:
+          summary: "Endpoint {{ $labels.endpoint }} has had its circuit breaker open for 30 minutes"
+
+      - alert: WebhookEndpointSlow
+        expr: |
+          histogram_quantile(0.95,
+            sum by (endpoint, le) (rate(webhook_attempt_duration_seconds_bucket[15m]))) > 5
+        for: 15m
+        labels: {severity: info, audience: customer}
+        annotations:
+          summary: "Endpoint {{ $labels.endpoint }} takes over 5s to answer at p95"
+
+      - alert: WebhookDeadLetters
+        # Deliveries that spent every attempt: someone should look at them
+        # and replay once the receiver is fixed.
+        expr: sum by (endpoint) (increase(webhook_deliveries_ended_total{state="failed"}[30m])) > 0
+        labels: {severity: info, audience: customer}
+        annotations:
+          summary: "Endpoint {{ $labels.endpoint }} has deliveries in the dead-letter queue"

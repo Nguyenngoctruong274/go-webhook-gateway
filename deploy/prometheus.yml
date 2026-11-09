@@ -1,0 +1,13 @@
+# Scrape config for the compose stack (day 10). /metrics is served next
+# to the probes without the API token: keep it on an internal network.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: webhookd
+    static_configs:
+      - targets: ["webhookd:8080"]
